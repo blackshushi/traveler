@@ -5,6 +5,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -41,9 +42,13 @@ const _supportedCurrencies = [
 typedef AttachmentAction =
     void Function(TravelEvent? event, TravelAttachment attachment);
 
-enum EventAction { plan, experience, expense, attachFile, delete }
+enum EventAction { plan, experience, expense, files, delete }
 
 enum EventFormMode { plan, experience, expense }
+
+enum ExpenseInputMode { total, perPerson }
+
+enum AttachmentKind { file, photo }
 
 String _newId(String prefix) {
   final timestamp = DateTime.now().microsecondsSinceEpoch;
@@ -117,6 +122,20 @@ String _guessMimeType(String? extension) {
     default:
       return 'application/octet-stream';
   }
+}
+
+int _minutesBetween(TimeOfDay start, TimeOfDay end) {
+  final startMinutes = start.hour * 60 + start.minute;
+  final endMinutes = end.hour * 60 + end.minute;
+  final difference = endMinutes - startMinutes;
+  return difference <= 0 ? 1 : difference;
+}
+
+String _attachmentKindName(AttachmentKind kind) {
+  return switch (kind) {
+    AttachmentKind.file => 'File',
+    AttachmentKind.photo => 'Photo',
+  };
 }
 
 class TravelerApp extends StatelessWidget {
@@ -264,6 +283,28 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     }
   }
 
+  Future<void> _showMembersDialog(TravelTrip trip) async {
+    final members = await showDialog<List<TravelMember>>(
+      context: context,
+      builder: (context) => MembersDialog(members: trip.members),
+    );
+
+    if (members == null) {
+      return;
+    }
+
+    final memberIds = members.map((member) => member.id).toSet();
+    final events = trip.events.map((event) {
+      return event.copyWith(
+        expenseMemberIds: event.expenseMemberIds
+            .where(memberIds.contains)
+            .toList(),
+      );
+    }).toList();
+
+    await _upsertTrip(trip.copyWith(members: members, events: events));
+  }
+
   Future<void> _showEventDialog(
     TravelTrip trip, {
     TravelEvent? event,
@@ -315,11 +356,25 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
         );
       case EventAction.expense:
         await _showEventDialog(trip, event: event, mode: EventFormMode.expense);
-      case EventAction.attachFile:
-        await _pickAttachment(trip, event: event);
+      case EventAction.files:
+        await _showEventFiles(trip, event);
       case EventAction.delete:
         await _deleteEvent(trip, event);
     }
+  }
+
+  Future<void> _showEventFiles(TravelTrip trip, TravelEvent event) async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) => EventFilesDialog(
+        event: event,
+        onOpenAttachment: _openAttachment,
+        onAttachFile: () => _pickAttachment(trip, event: event),
+        onPickPhoto: (source) => _pickPhoto(trip, event, source),
+        onRemoveAttachment: (attachment) =>
+            _removeAttachment(trip, attachment, event),
+      ),
+    );
   }
 
   Future<void> _deleteEvent(TravelTrip trip, TravelEvent event) async {
@@ -328,6 +383,26 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
         events: trip.events
             .where((candidate) => candidate.id != event.id)
             .toList(),
+      ),
+    );
+  }
+
+  Future<void> _addAttachmentToEvent(
+    TravelTrip trip,
+    TravelEvent event,
+    TravelAttachment attachment,
+  ) async {
+    await _upsertTrip(
+      trip.copyWith(
+        events: trip.events.map((candidate) {
+          if (candidate.id != event.id) {
+            return candidate;
+          }
+
+          return candidate.copyWith(
+            attachments: [...candidate.attachments, attachment],
+          );
+        }).toList(),
       ),
     );
   }
@@ -367,23 +442,48 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
       path: file.path,
       bytesBase64: file.bytes == null ? null : base64Encode(file.bytes!),
       mimeType: file.extension == null ? null : _guessMimeType(file.extension),
+      kind: AttachmentKind.file,
       sizeBytes: file.size,
       addedAt: DateTime.now(),
     );
 
-    await _upsertTrip(
-      trip.copyWith(
-        events: trip.events.map((candidate) {
-          if (candidate.id != targetEvent!.id) {
-            return candidate;
-          }
+    await _addAttachmentToEvent(trip, targetEvent, attachment);
+  }
 
-          return candidate.copyWith(
-            attachments: [...candidate.attachments, attachment],
-          );
-        }).toList(),
-      ),
-    );
+  Future<void> _pickPhoto(
+    TravelTrip trip,
+    TravelEvent event,
+    ImageSource source,
+  ) async {
+    try {
+      final photo = await ImagePicker().pickImage(
+        source: source,
+        imageQuality: 86,
+      );
+
+      if (photo == null) {
+        return;
+      }
+
+      final bytes = await photo.readAsBytes();
+      final attachment = TravelAttachment(
+        id: _newId('photo'),
+        name: photo.name,
+        path: kIsWeb ? null : photo.path,
+        bytesBase64: base64Encode(bytes),
+        mimeType: photo.mimeType ?? _guessMimeType(photo.name.split('.').last),
+        kind: AttachmentKind.photo,
+        sizeBytes: bytes.length,
+        addedAt: DateTime.now(),
+      );
+
+      await _addAttachmentToEvent(trip, event, attachment);
+    } on Object {
+      if (!mounted) {
+        return;
+      }
+      _showSnack('Could not add a photo on this device.');
+    }
   }
 
   Future<void> _removeAttachment(
@@ -421,18 +521,19 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
 
   Future<void> _openAttachment(TravelAttachment attachment) async {
     final bytesBase64 = attachment.bytesBase64;
+    if (bytesBase64 != null && bytesBase64.isNotEmpty) {
+      await showDialog<void>(
+        context: context,
+        builder: (context) => AttachmentPreviewDialog(attachment: attachment),
+      );
+      return;
+    }
+
     final path = attachment.path;
-    final uri = bytesBase64 == null || bytesBase64.isEmpty
-        ? path == null || path.isEmpty
-              ? null
-              : Uri.file(path)
-        : Uri.dataFromBytes(
-            base64Decode(bytesBase64),
-            mimeType: attachment.mimeType ?? 'application/octet-stream',
-          );
+    final uri = path == null || path.isEmpty ? null : Uri.file(path);
 
     if (uri == null) {
-      _showSnack('This file cannot be opened from the web preview.');
+      _showSnack('This file cannot be opened from this preview.');
       return;
     }
 
@@ -463,16 +564,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     final selectedTrip = isWide ? _selectedTrip ?? _firstTrip : _selectedTrip;
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Traveler'),
-        actions: [
-          IconButton(
-            tooltip: 'New trip',
-            onPressed: () => _showTripDialog(),
-            icon: const Icon(Icons.add_location_alt_outlined),
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('Traveler')),
       body: SafeArea(
         child: _trips.isEmpty
             ? EmptyTripsView(onCreate: () => _showTripDialog())
@@ -499,6 +591,8 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                             onEditTrip: () {
                               _showTripDialog(trip: selectedTrip);
                             },
+                            onManageMembers: () =>
+                                _showMembersDialog(selectedTrip),
                             onDeleteTrip: () => _deleteTrip(selectedTrip),
                             onAddEvent: () => _showEventDialog(selectedTrip),
                             onEditEvent: (event) =>
@@ -537,6 +631,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                 compact: true,
                 onBack: () => setState(() => _selectedTripId = null),
                 onEditTrip: () => _showTripDialog(trip: selectedTrip),
+                onManageMembers: () => _showMembersDialog(selectedTrip),
                 onDeleteTrip: () => _deleteTrip(selectedTrip),
                 onAddEvent: () => _showEventDialog(selectedTrip),
                 onEditEvent: (event) =>
@@ -688,6 +783,7 @@ class TripDetailView extends StatelessWidget {
     super.key,
     required this.trip,
     required this.onEditTrip,
+    required this.onManageMembers,
     required this.onDeleteTrip,
     required this.onAddEvent,
     required this.onEditEvent,
@@ -705,6 +801,7 @@ class TripDetailView extends StatelessWidget {
   final bool compact;
   final VoidCallback? onBack;
   final VoidCallback onEditTrip;
+  final VoidCallback onManageMembers;
   final VoidCallback onDeleteTrip;
   final VoidCallback onAddEvent;
   final ValueChanged<TravelEvent> onEditEvent;
@@ -727,6 +824,7 @@ class TripDetailView extends StatelessWidget {
             compact: compact,
             onBack: onBack,
             onEdit: onEditTrip,
+            onManageMembers: onManageMembers,
             onDelete: onDeleteTrip,
           ),
           const TabBar(
@@ -770,6 +868,7 @@ class TripHeader extends StatelessWidget {
     required this.trip,
     required this.compact,
     required this.onEdit,
+    required this.onManageMembers,
     required this.onDelete,
     this.onBack,
   });
@@ -777,6 +876,7 @@ class TripHeader extends StatelessWidget {
   final TravelTrip trip;
   final bool compact;
   final VoidCallback onEdit;
+  final VoidCallback onManageMembers;
   final VoidCallback onDelete;
   final VoidCallback? onBack;
 
@@ -824,6 +924,10 @@ class TripHeader extends StatelessWidget {
                       icon: Icons.calendar_today_outlined,
                       label: range,
                     ),
+                    TripMetaChip(
+                      icon: Icons.group_outlined,
+                      label: '${trip.members.length} members',
+                    ),
                   ],
                 ),
               ],
@@ -834,6 +938,8 @@ class TripHeader extends StatelessWidget {
             onSelected: (value) {
               if (value == 'edit') {
                 onEdit();
+              } else if (value == 'members') {
+                onManageMembers();
               } else if (value == 'delete') {
                 onDelete();
               }
@@ -844,6 +950,13 @@ class TripHeader extends StatelessWidget {
                 child: ListTile(
                   leading: Icon(Icons.edit_outlined),
                   title: Text('Edit trip'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'members',
+                child: ListTile(
+                  leading: Icon(Icons.group_outlined),
+                  title: Text('Members'),
                 ),
               ),
               PopupMenuItem(
@@ -1028,7 +1141,7 @@ class TimelineEventCard extends StatelessWidget {
                                 ),
                                 const SizedBox(height: 4),
                                 Text(
-                                  '${_dayFormatter.format(event.startAt)} - ${event.durationMinutes} min',
+                                  '${_dayFormatter.format(event.startAt)} - ${event.timeRangeLabel}',
                                   style: theme.textTheme.bodySmall,
                                 ),
                               ],
@@ -1164,10 +1277,10 @@ class EventActionsSheet extends StatelessWidget {
               onTap: () => Navigator.of(context).pop(EventAction.expense),
             ),
             ActionTile(
-              icon: Icons.attach_file,
-              title: 'Attach file',
-              subtitle: 'Tickets, bookings, documents, or photos',
-              onTap: () => Navigator.of(context).pop(EventAction.attachFile),
+              icon: Icons.folder_open_outlined,
+              title: 'Files and photos',
+              subtitle: 'View, add, or remove event files',
+              onTap: () => Navigator.of(context).pop(EventAction.files),
             ),
             const Divider(),
             ActionTile(
@@ -1331,7 +1444,17 @@ class JournalEventCard extends StatelessWidget {
                       ),
                     ),
                   ),
-                  Text(_shortDayFormatter.format(event.startAt)),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(_shortDayFormatter.format(event.startAt)),
+                      const SizedBox(height: 2),
+                      Text(
+                        event.timeRangeLabel,
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
+                  ),
                 ],
               ),
               if (event.journal.isNotEmpty) ...[
@@ -1756,6 +1879,306 @@ class AttachmentTargetDialog extends StatelessWidget {
   }
 }
 
+class EventFilesDialog extends StatelessWidget {
+  const EventFilesDialog({
+    super.key,
+    required this.event,
+    required this.onOpenAttachment,
+    required this.onAttachFile,
+    required this.onPickPhoto,
+    required this.onRemoveAttachment,
+  });
+
+  final TravelEvent event;
+  final ValueChanged<TravelAttachment> onOpenAttachment;
+  final Future<void> Function() onAttachFile;
+  final Future<void> Function(ImageSource source) onPickPhoto;
+  final Future<void> Function(TravelAttachment attachment) onRemoveAttachment;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('${event.title} files'),
+      content: SizedBox(
+        width: min(MediaQuery.sizeOf(context).width - 48, 520),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: () async {
+                    await onAttachFile();
+                    if (context.mounted) {
+                      Navigator.of(context).pop();
+                    }
+                  },
+                  icon: const Icon(Icons.attach_file),
+                  label: const Text('File'),
+                ),
+                FilledButton.tonalIcon(
+                  onPressed: () async {
+                    await onPickPhoto(ImageSource.gallery);
+                    if (context.mounted) {
+                      Navigator.of(context).pop();
+                    }
+                  },
+                  icon: const Icon(Icons.photo_library_outlined),
+                  label: const Text('Gallery'),
+                ),
+                FilledButton.tonalIcon(
+                  onPressed: () async {
+                    await onPickPhoto(ImageSource.camera);
+                    if (context.mounted) {
+                      Navigator.of(context).pop();
+                    }
+                  },
+                  icon: const Icon(Icons.photo_camera_outlined),
+                  label: const Text('Camera'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            if (event.attachments.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('No files or photos yet'),
+              )
+            else
+              Flexible(
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: event.attachments.length,
+                  separatorBuilder: (context, index) =>
+                      const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final attachment = event.attachments[index];
+                    return ListTile(
+                      leading: Icon(
+                        attachment.kind == AttachmentKind.photo
+                            ? Icons.image_outlined
+                            : Icons.insert_drive_file_outlined,
+                      ),
+                      title: Text(
+                        attachment.name,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        '${_attachmentKindName(attachment.kind)} - ${_formatBytes(attachment.sizeBytes)}',
+                      ),
+                      onTap: () => onOpenAttachment(attachment),
+                      trailing: IconButton(
+                        tooltip: 'Remove',
+                        onPressed: () async {
+                          await onRemoveAttachment(attachment);
+                          if (context.mounted) {
+                            Navigator.of(context).pop();
+                          }
+                        },
+                        icon: const Icon(Icons.delete_outline),
+                      ),
+                    );
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+}
+
+class AttachmentPreviewDialog extends StatelessWidget {
+  const AttachmentPreviewDialog({super.key, required this.attachment});
+
+  final TravelAttachment attachment;
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = base64Decode(attachment.bytesBase64!);
+    final mimeType = attachment.mimeType ?? 'application/octet-stream';
+    final isImage = mimeType.startsWith('image/');
+    final isText = mimeType.startsWith('text/');
+
+    return AlertDialog(
+      title: Text(
+        attachment.name,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+      content: SizedBox(
+        width: min(MediaQuery.sizeOf(context).width - 48, 560),
+        child: isImage
+            ? ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Image.memory(bytes, fit: BoxFit.contain),
+              )
+            : isText
+            ? ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 360),
+                child: SingleChildScrollView(
+                  child: Text(utf8.decode(bytes, allowMalformed: true)),
+                ),
+              )
+            : Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(_attachmentKindName(attachment.kind)),
+                  const SizedBox(height: 8),
+                  Text(_formatBytes(attachment.sizeBytes)),
+                  const SizedBox(height: 8),
+                  Text(mimeType),
+                ],
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+        FilledButton.icon(
+          onPressed: () {
+            launchUrl(
+              Uri.dataFromBytes(bytes, mimeType: mimeType),
+              mode: LaunchMode.externalApplication,
+            );
+          },
+          icon: const Icon(Icons.open_in_new),
+          label: const Text('Open'),
+        ),
+      ],
+    );
+  }
+}
+
+class MembersDialog extends StatefulWidget {
+  const MembersDialog({super.key, required this.members});
+
+  final List<TravelMember> members;
+
+  @override
+  State<MembersDialog> createState() => _MembersDialogState();
+}
+
+class _MembersDialogState extends State<MembersDialog> {
+  late final TextEditingController _memberController;
+  late List<TravelMember> _members;
+
+  @override
+  void initState() {
+    super.initState();
+    _memberController = TextEditingController();
+    _members = [...widget.members];
+  }
+
+  @override
+  void dispose() {
+    _memberController.dispose();
+    super.dispose();
+  }
+
+  void _addMember() {
+    final name = _memberController.text.trim();
+    if (name.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _members = [..._members, TravelMember(id: _newId('member'), name: name)];
+      _memberController.clear();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Trip members'),
+      content: SizedBox(
+        width: min(MediaQuery.sizeOf(context).width - 48, 460),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _memberController,
+                    decoration: const InputDecoration(
+                      labelText: 'Member name',
+                      prefixIcon: Icon(Icons.person_add_outlined),
+                    ),
+                    onSubmitted: (_) => _addMember(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filledTonal(
+                  tooltip: 'Add member',
+                  onPressed: _addMember,
+                  icon: const Icon(Icons.add),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            if (_members.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('No members yet'),
+              )
+            else
+              Flexible(
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  itemCount: _members.length,
+                  separatorBuilder: (context, index) =>
+                      const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final member = _members[index];
+                    return ListTile(
+                      leading: const Icon(Icons.person_outline),
+                      title: Text(member.name),
+                      trailing: IconButton(
+                        tooltip: 'Remove member',
+                        onPressed: () {
+                          setState(() {
+                            _members = [
+                              ..._members.take(index),
+                              ..._members.skip(index + 1),
+                            ];
+                          });
+                        },
+                        icon: const Icon(Icons.delete_outline),
+                      ),
+                    );
+                  },
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(_members),
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
 class EmptyTabView extends StatelessWidget {
   const EmptyTabView({
     super.key,
@@ -1938,6 +2361,7 @@ class _TripFormDialogState extends State<TripFormDialog> {
       endDate: _endDate,
       events: existing?.events ?? const [],
       attachments: existing?.attachments ?? const [],
+      members: existing?.members ?? const [],
     );
 
     Navigator.of(context).pop(trip);
@@ -2089,7 +2513,10 @@ class _EventFormDialogState extends State<EventFormDialog> {
   late final TextEditingController _splitController;
   late DateTime _date;
   late TimeOfDay _time;
+  late TimeOfDay _endTime;
   late bool _isFlexible;
+  var _expenseInputMode = ExpenseInputMode.total;
+  late Set<String> _selectedExpenseMemberIds;
 
   @override
   void initState() {
@@ -2114,7 +2541,11 @@ class _EventFormDialogState extends State<EventFormDialog> {
     );
     _date = DateTime(startAt.year, startAt.month, startAt.day);
     _time = TimeOfDay.fromDateTime(startAt);
+    _endTime = TimeOfDay.fromDateTime(
+      startAt.add(Duration(minutes: event?.durationMinutes ?? 60)),
+    );
     _isFlexible = event?.isFlexible ?? false;
+    _selectedExpenseMemberIds = {...?event?.expenseMemberIds};
   }
 
   @override
@@ -2152,7 +2583,25 @@ class _EventFormDialogState extends State<EventFormDialog> {
       return;
     }
 
-    setState(() => _time = selected);
+    setState(() {
+      _time = selected;
+      if (!_isFlexible && _minutesBetween(_time, _endTime) <= 1) {
+        _endTime = TimeOfDay(hour: (_time.hour + 1) % 24, minute: _time.minute);
+      }
+    });
+  }
+
+  Future<void> _pickEndTime() async {
+    final selected = await showTimePicker(
+      context: context,
+      initialTime: _endTime,
+    );
+
+    if (selected == null || !mounted) {
+      return;
+    }
+
+    setState(() => _endTime = selected);
   }
 
   void _save() {
@@ -2160,10 +2609,17 @@ class _EventFormDialogState extends State<EventFormDialog> {
       return;
     }
 
-    final expense = _expenseController.text.trim().isEmpty
+    final enteredExpense = _expenseController.text.trim().isEmpty
         ? 0.0
         : double.parse(_expenseController.text.trim());
-    final split = int.tryParse(_splitController.text.trim()) ?? 1;
+    final selectedSplit = _selectedExpenseMemberIds.length;
+    final split = selectedSplit == 0
+        ? int.tryParse(_splitController.text.trim()) ?? 1
+        : selectedSplit;
+    final expense = _expenseInputMode == ExpenseInputMode.perPerson
+        ? enteredExpense * max(1, split)
+        : enteredExpense;
+    final duration = _isFlexible ? 0 : _minutesBetween(_time, _endTime);
     final startAt = DateTime(
       _date.year,
       _date.month,
@@ -2178,7 +2634,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
         title: _titleController.text.trim(),
         location: _locationController.text.trim(),
         startAt: startAt,
-        durationMinutes: int.parse(_durationController.text.trim()),
+        durationMinutes: duration,
         planNotes: _planController.text.trim(),
         journal: _journalController.text.trim(),
         feeling: _feelingController.text.trim(),
@@ -2186,6 +2642,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
         splitCount: max(1, split),
         isFlexible: _isFlexible,
         attachments: widget.event?.attachments ?? const [],
+        expenseMemberIds: _selectedExpenseMemberIds.toList(),
       ),
     );
   }
@@ -2247,20 +2704,26 @@ class _EventFormDialogState extends State<EventFormDialog> {
                         child: OutlinedButton.icon(
                           onPressed: _pickTime,
                           icon: const Icon(Icons.schedule),
-                          label: Text(_time.format(context)),
+                          label: Text('From ${_time.format(context)}'),
                         ),
                       ),
                     ],
                   ),
                   const SizedBox(height: 12),
-                  TextFormField(
-                    controller: _durationController,
-                    decoration: const InputDecoration(
-                      labelText: 'Duration minutes',
-                      prefixIcon: Icon(Icons.timer_outlined),
-                    ),
-                    keyboardType: TextInputType.number,
-                    validator: _positiveIntegerValidator,
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton.icon(
+                          onPressed: _isFlexible ? null : _pickEndTime,
+                          icon: const Icon(Icons.timer_outlined),
+                          label: Text(
+                            _isFlexible
+                                ? 'End flexible'
+                                : 'To ${_endTime.format(context)}',
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                   const SizedBox(height: 12),
                   CheckboxListTile(
@@ -2269,6 +2732,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
                       setState(() => _isFlexible = value ?? false);
                     },
                     title: const Text('Flexible timing'),
+                    subtitle: const Text('End time is disabled when flexible'),
                     controlAffinity: ListTileControlAffinity.leading,
                   ),
                   const SizedBox(height: 12),
@@ -2303,10 +2767,30 @@ class _EventFormDialogState extends State<EventFormDialog> {
                   ),
                 ],
                 if (isExpenseMode) ...[
+                  SegmentedButton<ExpenseInputMode>(
+                    segments: const [
+                      ButtonSegment(
+                        value: ExpenseInputMode.total,
+                        icon: Icon(Icons.payments_outlined),
+                        label: Text('Total'),
+                      ),
+                      ButtonSegment(
+                        value: ExpenseInputMode.perPerson,
+                        icon: Icon(Icons.person_outline),
+                        label: Text('Per pax'),
+                      ),
+                    ],
+                    selected: {_expenseInputMode},
+                    onSelectionChanged: (value) {
+                      setState(() => _expenseInputMode = value.first);
+                    },
+                  ),
+                  const SizedBox(height: 12),
                   TextFormField(
                     controller: _expenseController,
                     decoration: InputDecoration(
-                      labelText: 'Expense ${widget.trip.targetCurrency}',
+                      labelText:
+                          '${_expenseInputMode == ExpenseInputMode.total ? 'Total' : 'Per pax'} ${widget.trip.targetCurrency}',
                       prefixIcon: const Icon(Icons.receipt_long_outlined),
                     ),
                     keyboardType: const TextInputType.numberWithOptions(
@@ -2315,12 +2799,53 @@ class _EventFormDialogState extends State<EventFormDialog> {
                     validator: _optionalPositiveNumberValidator,
                   ),
                   const SizedBox(height: 12),
+                  if (widget.trip.members.isNotEmpty) ...[
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        'Split with',
+                        style: Theme.of(context).textTheme.labelLarge,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          for (final member in widget.trip.members)
+                            FilterChip(
+                              label: Text(member.name),
+                              selected: _selectedExpenseMemberIds.contains(
+                                member.id,
+                              ),
+                              onSelected: (selected) {
+                                setState(() {
+                                  if (selected) {
+                                    _selectedExpenseMemberIds.add(member.id);
+                                  } else {
+                                    _selectedExpenseMemberIds.remove(member.id);
+                                  }
+                                  _splitController.text = max(
+                                    1,
+                                    _selectedExpenseMemberIds.length,
+                                  ).toString();
+                                });
+                              },
+                            ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
                   TextFormField(
                     controller: _splitController,
                     decoration: const InputDecoration(
                       labelText: 'Split count',
                       prefixIcon: Icon(Icons.group_outlined),
                     ),
+                    enabled: _selectedExpenseMemberIds.isEmpty,
                     keyboardType: TextInputType.number,
                     validator: _positiveIntegerValidator,
                   ),
@@ -2418,6 +2943,7 @@ class TravelTrip {
     required this.endDate,
     required this.events,
     required this.attachments,
+    required this.members,
   });
 
   factory TravelTrip.fromJson(Map<String, Object?> json) {
@@ -2441,6 +2967,10 @@ class TravelTrip {
           .whereType<Map<String, Object?>>()
           .map(TravelAttachment.fromJson)
           .toList(),
+      members: (json['members'] as List? ?? const [])
+          .whereType<Map<String, Object?>>()
+          .map(TravelMember.fromJson)
+          .toList(),
     );
   }
 
@@ -2453,6 +2983,7 @@ class TravelTrip {
   final DateTime? endDate;
   final List<TravelEvent> events;
   final List<TravelAttachment> attachments;
+  final List<TravelMember> members;
 
   List<TravelEvent> get sortedEvents {
     final sorted = [...events];
@@ -2488,6 +3019,7 @@ class TravelTrip {
     DateTime? endDate,
     List<TravelEvent>? events,
     List<TravelAttachment>? attachments,
+    List<TravelMember>? members,
   }) {
     return TravelTrip(
       id: id,
@@ -2499,6 +3031,7 @@ class TravelTrip {
       endDate: endDate ?? this.endDate,
       events: events ?? this.events,
       attachments: attachments ?? this.attachments,
+      members: members ?? this.members,
     );
   }
 
@@ -2515,7 +3048,26 @@ class TravelTrip {
       'attachments': attachments
           .map((attachment) => attachment.toJson())
           .toList(),
+      'members': members.map((member) => member.toJson()).toList(),
     };
+  }
+}
+
+class TravelMember {
+  const TravelMember({required this.id, required this.name});
+
+  factory TravelMember.fromJson(Map<String, Object?> json) {
+    return TravelMember(
+      id: json['id'] as String? ?? _newId('member'),
+      name: json['name'] as String? ?? 'Member',
+    );
+  }
+
+  final String id;
+  final String name;
+
+  Map<String, Object?> toJson() {
+    return {'id': id, 'name': name};
   }
 }
 
@@ -2533,6 +3085,7 @@ class TravelEvent {
     required this.splitCount,
     required this.isFlexible,
     required this.attachments,
+    required this.expenseMemberIds,
   });
 
   factory TravelEvent.fromJson(Map<String, Object?> json) {
@@ -2553,6 +3106,9 @@ class TravelEvent {
           .whereType<Map<String, Object?>>()
           .map(TravelAttachment.fromJson)
           .toList(),
+      expenseMemberIds: (json['expenseMemberIds'] as List? ?? const [])
+          .whereType<String>()
+          .toList(),
     );
   }
 
@@ -2568,6 +3124,17 @@ class TravelEvent {
   final int splitCount;
   final bool isFlexible;
   final List<TravelAttachment> attachments;
+  final List<String> expenseMemberIds;
+
+  String get timeRangeLabel {
+    final start = _timeFormatter.format(startAt);
+    if (isFlexible) {
+      return '$start - flexible';
+    }
+
+    final end = startAt.add(Duration(minutes: durationMinutes));
+    return '$start - ${_timeFormatter.format(end)}';
+  }
 
   TravelEvent copyWith({
     String? title,
@@ -2581,6 +3148,7 @@ class TravelEvent {
     int? splitCount,
     bool? isFlexible,
     List<TravelAttachment>? attachments,
+    List<String>? expenseMemberIds,
   }) {
     return TravelEvent(
       id: id,
@@ -2595,6 +3163,7 @@ class TravelEvent {
       splitCount: splitCount ?? this.splitCount,
       isFlexible: isFlexible ?? this.isFlexible,
       attachments: attachments ?? this.attachments,
+      expenseMemberIds: expenseMemberIds ?? this.expenseMemberIds,
     );
   }
 
@@ -2614,6 +3183,7 @@ class TravelEvent {
       'attachments': attachments
           .map((attachment) => attachment.toJson())
           .toList(),
+      'expenseMemberIds': expenseMemberIds,
     };
   }
 }
@@ -2625,6 +3195,7 @@ class TravelAttachment {
     required this.path,
     required this.bytesBase64,
     required this.mimeType,
+    required this.kind,
     required this.sizeBytes,
     required this.addedAt,
   });
@@ -2636,6 +3207,10 @@ class TravelAttachment {
       path: json['path'] as String?,
       bytesBase64: json['bytesBase64'] as String?,
       mimeType: json['mimeType'] as String?,
+      kind: AttachmentKind.values.firstWhere(
+        (kind) => kind.name == (json['kind'] as String? ?? 'file'),
+        orElse: () => AttachmentKind.file,
+      ),
       sizeBytes: (json['sizeBytes'] as num?)?.toInt() ?? 0,
       addedAt:
           DateTime.tryParse(json['addedAt'] as String? ?? '') ?? DateTime.now(),
@@ -2647,6 +3222,7 @@ class TravelAttachment {
   final String? path;
   final String? bytesBase64;
   final String? mimeType;
+  final AttachmentKind kind;
   final int sizeBytes;
   final DateTime addedAt;
 
@@ -2657,6 +3233,7 @@ class TravelAttachment {
       'path': path,
       'bytesBase64': bytesBase64,
       'mimeType': mimeType,
+      'kind': kind.name,
       'sizeBytes': sizeBytes,
       'addedAt': addedAt.toIso8601String(),
     };

@@ -49,6 +49,10 @@
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Traveler uses the camera to save trip photos with events.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Traveler uses the photo library to attach trip photos to events.</string>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>
