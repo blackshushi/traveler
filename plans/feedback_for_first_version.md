@@ -1,0 +1,6 @@
+I am testing in web version. I am expecting the ios and android should work as the same. So I will give the feedback based on what I tested on web.
+1. Lobby page is missing, after creating trip, coulnd't navigate or check other trip. Or, the back button is not functional, after creating trip, clicking on the back button is not working and stay at the same page.
+2. Currency converter -> can make it chooseable for the currency field? and give the initiated rate based on the current rate.
+3. Add Event is fine, but the form is too general, can make it a chooseable list before really key in. for example, creating event shoulnd't show experience, feeling expenses, split count this kind of information. instead, after creating, once creating on it, these should be chooseable for user to decide which they want to key in.
+4. Can make the journal first tab as user might always want to overview the whole trip. Files attach seems not working after adding. after clicking there's nothing show out. And, I am expecting this should stick with plan, so this tab is fine, user can view the list of attache file, but I am expecting user to attach this file for event.
+5. The top design currency is kind of redundant, remove it. 
