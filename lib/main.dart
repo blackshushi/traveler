@@ -494,6 +494,68 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     );
   }
 
+  Future<void> _showEventTitleDialog(TravelTrip trip, TravelEvent event) async {
+    final titleController = TextEditingController(text: event.title);
+    final formKey = GlobalKey<FormState>();
+
+    final title = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Edit title'),
+        content: Form(
+          key: formKey,
+          child: TextFormField(
+            controller: titleController,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: 'Event title',
+              prefixIcon: Icon(Icons.event_outlined),
+            ),
+            textInputAction: TextInputAction.done,
+            validator: _requiredValidator,
+            onFieldSubmitted: (_) {
+              if (formKey.currentState!.validate()) {
+                Navigator.of(context).pop(titleController.text.trim());
+              }
+            },
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (formKey.currentState!.validate()) {
+                Navigator.of(context).pop(titleController.text.trim());
+              }
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+
+    titleController.dispose();
+
+    if (title == null || title == event.title) {
+      return;
+    }
+
+    await _upsertTrip(
+      trip.copyWith(
+        events: trip.events.map((candidate) {
+          if (candidate.id != event.id) {
+            return candidate;
+          }
+
+          return candidate.copyWith(title: title);
+        }).toList(),
+      ),
+    );
+  }
+
   Future<void> _addAttachmentToEvent(
     TravelTrip trip,
     TravelEvent event,
@@ -764,6 +826,8 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                                 _showEventActions(selectedTrip, event),
                             onDeleteEvent: (event) =>
                                 _deleteEvent(selectedTrip, event),
+                            onRenameEvent: (event) =>
+                                _showEventTitleDialog(selectedTrip, event),
                             onTripChanged: _upsertTrip,
                             onAddAttachment: (event) {
                               _pickAttachment(selectedTrip, event: event);
@@ -811,6 +875,8 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                 onOpenEventActions: (event) =>
                     _showEventActions(selectedTrip, event),
                 onDeleteEvent: (event) => _deleteEvent(selectedTrip, event),
+                onRenameEvent: (event) =>
+                    _showEventTitleDialog(selectedTrip, event),
                 onTripChanged: _upsertTrip,
                 onAddAttachment: (event) =>
                     _pickAttachment(selectedTrip, event: event),
@@ -952,6 +1018,7 @@ class TripDetailView extends StatelessWidget {
     required this.onEditEvent,
     required this.onOpenEventActions,
     required this.onDeleteEvent,
+    required this.onRenameEvent,
     required this.onTripChanged,
     required this.onAddAttachment,
     required this.onOpenAttachment,
@@ -971,6 +1038,7 @@ class TripDetailView extends StatelessWidget {
   final ValueChanged<TravelEvent> onEditEvent;
   final ValueChanged<TravelEvent> onOpenEventActions;
   final ValueChanged<TravelEvent> onDeleteEvent;
+  final ValueChanged<TravelEvent> onRenameEvent;
   final ValueChanged<TravelTrip> onTripChanged;
   final ValueChanged<TravelEvent?> onAddAttachment;
   final ValueChanged<TravelAttachment> onOpenAttachment;
@@ -1010,6 +1078,7 @@ class TripDetailView extends StatelessWidget {
                   onEditEvent: onEditEvent,
                   onOpenEventActions: onOpenEventActions,
                   onDeleteEvent: onDeleteEvent,
+                  onRenameEvent: onRenameEvent,
                 ),
                 CurrencyTab(trip: trip, onTripChanged: onTripChanged),
                 FilesTab(
@@ -1148,6 +1217,7 @@ class PlanTab extends StatelessWidget {
     required this.onEditEvent,
     required this.onOpenEventActions,
     required this.onDeleteEvent,
+    required this.onRenameEvent,
   });
 
   final TravelTrip trip;
@@ -1155,6 +1225,7 @@ class PlanTab extends StatelessWidget {
   final ValueChanged<TravelEvent> onEditEvent;
   final ValueChanged<TravelEvent> onOpenEventActions;
   final ValueChanged<TravelEvent> onDeleteEvent;
+  final ValueChanged<TravelEvent> onRenameEvent;
 
   @override
   Widget build(BuildContext context) {
@@ -1183,6 +1254,7 @@ class PlanTab extends StatelessWidget {
           onOpenActions: () => onOpenEventActions(event),
           onEdit: () => onEditEvent(event),
           onDelete: () => onDeleteEvent(event),
+          onRename: () => onRenameEvent(event),
         ),
       );
     }
@@ -1255,6 +1327,7 @@ class TimelineEventCard extends StatelessWidget {
     required this.onOpenActions,
     required this.onEdit,
     required this.onDelete,
+    required this.onRename,
   });
 
   final TravelTrip trip;
@@ -1264,6 +1337,7 @@ class TimelineEventCard extends StatelessWidget {
   final VoidCallback onOpenActions;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
+  final VoidCallback onRename;
 
   @override
   Widget build(BuildContext context) {
@@ -1313,98 +1387,149 @@ class TimelineEventCard extends StatelessWidget {
           Expanded(
             child: Card(
               margin: const EdgeInsets.only(bottom: 12),
-              child: InkWell(
-                onTap: onEdit,
-                onLongPress: onOpenActions,
-                borderRadius: BorderRadius.circular(8),
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  event.title,
-                                  style: theme.textTheme.titleMedium?.copyWith(
-                                    fontWeight: FontWeight.w700,
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Flexible(
+                                    child: TextButton(
+                                      onPressed: onRename,
+                                      style: TextButton.styleFrom(
+                                        alignment: Alignment.centerLeft,
+                                        foregroundColor: colors.onSurface,
+                                        padding: EdgeInsets.zero,
+                                        minimumSize: Size.zero,
+                                        tapTargetSize:
+                                            MaterialTapTargetSize.shrinkWrap,
+                                      ),
+                                      child: Text(
+                                        event.title,
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: theme.textTheme.titleMedium
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                      ),
+                                    ),
+                                  ),
+                                  IconButton(
+                                    tooltip: 'Edit title',
+                                    onPressed: onRename,
+                                    visualDensity: VisualDensity.compact,
+                                    icon: const Icon(
+                                      Icons.edit_outlined,
+                                      size: 18,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              InkWell(
+                                onTap: onOpenActions,
+                                onLongPress: onEdit,
+                                borderRadius: BorderRadius.circular(6),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 2,
+                                  ),
+                                  child: Text(
+                                    '${_dayFormatter.format(event.startAt)} - ${event.timeRangeLabel}',
+                                    style: theme.textTheme.bodySmall,
                                   ),
                                 ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  '${_dayFormatter.format(event.startAt)} - ${event.timeRangeLabel}',
-                                  style: theme.textTheme.bodySmall,
-                                ),
-                              ],
-                            ),
+                              ),
+                            ],
                           ),
-                          IconButton(
-                            tooltip: 'Delete event',
-                            onPressed: onDelete,
-                            icon: const Icon(Icons.delete_outline),
-                          ),
-                        ],
-                      ),
-                      if (event.location.isNotEmpty) ...[
-                        const SizedBox(height: 8),
-                        IconLine(
-                          icon: Icons.place_outlined,
-                          text: event.location,
+                        ),
+                        IconButton(
+                          tooltip: 'Delete event',
+                          onPressed: onDelete,
+                          icon: const Icon(Icons.delete_outline),
                         ),
                       ],
-                      if (event.planNotes.isNotEmpty) ...[
-                        const SizedBox(height: 12),
-                        Text(event.planNotes),
-                      ],
-                      const SizedBox(height: 12),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 6,
-                        children: [
-                          if (event.isFlexible)
-                            const Chip(
-                              avatar: Icon(Icons.bolt_outlined, size: 18),
-                              label: Text('Flexible'),
-                              visualDensity: VisualDensity.compact,
-                            ),
-                          if (event.expenseAmount > 0)
-                            Chip(
-                              avatar: const Icon(
-                                Icons.receipt_long_outlined,
-                                size: 18,
+                    ),
+                    InkWell(
+                      onTap: onOpenActions,
+                      onLongPress: onEdit,
+                      borderRadius: BorderRadius.circular(8),
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (event.location.isNotEmpty) ...[
+                              IconLine(
+                                icon: Icons.place_outlined,
+                                text: event.location,
                               ),
-                              label: Text(
-                                _formatMoney(
-                                  event.expenseCurrencyCode,
-                                  event.expenseAmount,
-                                ),
-                              ),
-                              visualDensity: VisualDensity.compact,
+                            ],
+                            if (event.planNotes.isNotEmpty) ...[
+                              const SizedBox(height: 12),
+                              Text(event.planNotes),
+                            ],
+                            const SizedBox(height: 12),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 6,
+                              children: [
+                                if (event.isFlexible)
+                                  const Chip(
+                                    avatar: Icon(Icons.bolt_outlined, size: 18),
+                                    label: Text('Flexible'),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                if (event.expenseAmount > 0)
+                                  Chip(
+                                    avatar: const Icon(
+                                      Icons.receipt_long_outlined,
+                                      size: 18,
+                                    ),
+                                    label: Text(
+                                      _formatMoney(
+                                        event.expenseCurrencyCode,
+                                        event.expenseAmount,
+                                      ),
+                                    ),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                if (event.feeling.isNotEmpty)
+                                  Chip(
+                                    avatar: const Icon(
+                                      Icons.favorite_border,
+                                      size: 18,
+                                    ),
+                                    label: Text(event.feeling),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                if (event.attachments.isNotEmpty)
+                                  Chip(
+                                    avatar: const Icon(
+                                      Icons.attach_file,
+                                      size: 18,
+                                    ),
+                                    label: Text(
+                                      '${event.attachments.length} files',
+                                    ),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                              ],
                             ),
-                          if (event.feeling.isNotEmpty)
-                            Chip(
-                              avatar: const Icon(
-                                Icons.favorite_border,
-                                size: 18,
-                              ),
-                              label: Text(event.feeling),
-                              visualDensity: VisualDensity.compact,
-                            ),
-                          if (event.attachments.isNotEmpty)
-                            Chip(
-                              avatar: const Icon(Icons.attach_file, size: 18),
-                              label: Text('${event.attachments.length} files'),
-                              visualDensity: VisualDensity.compact,
-                            ),
-                        ],
+                          ],
+                        ),
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
               ),
             ),
