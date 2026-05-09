@@ -21,6 +21,7 @@ final _timeFormatter = DateFormat('HH:mm');
 final _moneyFormatter = NumberFormat('#,##0.00');
 
 const _supportedCurrencies = [
+  TravelCurrency('MYR', 'Malaysian ringgit', 1.0000),
   TravelCurrency('CNY', 'Chinese yuan', 0.5765),
   TravelCurrency('JPY', 'Japanese yen', 0.0250),
   TravelCurrency('SGD', 'Singapore dollar', 3.0927),
@@ -41,6 +42,13 @@ const _supportedCurrencies = [
 
 typedef AttachmentAction =
     void Function(TravelEvent? event, TravelAttachment attachment);
+
+typedef AttachmentMemberAction =
+    Future<void> Function(
+      TravelEvent? event,
+      TravelAttachment attachment,
+      Set<String> memberIds,
+    );
 
 enum EventAction { plan, experience, expense, files, delete }
 
@@ -138,6 +146,62 @@ String _attachmentKindName(AttachmentKind kind) {
   };
 }
 
+String _formatMoney(String code, double amount) {
+  return '${_currencyForCode(code).code} ${_moneyFormatter.format(amount)}';
+}
+
+double _rateToMyrForCurrency(TravelTrip trip, String code) {
+  final currency = _currencyForCode(code);
+  if (currency.code == _currencyForCode(trip.targetCurrency).code) {
+    return trip.exchangeRateToMyr;
+  }
+
+  return currency.fallbackRateToMyr;
+}
+
+double _expenseAmountInMyr(TravelTrip trip, TravelEvent event) {
+  return event.expenseAmount *
+      _rateToMyrForCurrency(trip, event.expenseCurrencyCode);
+}
+
+double _expenseAmountInTripCurrency(TravelTrip trip, TravelEvent event) {
+  final targetRate = max(trip.exchangeRateToMyr, 0.000001);
+  return _expenseAmountInMyr(trip, event) / targetRate;
+}
+
+List<TravelMember> _membersForIds(TravelTrip trip, Iterable<String> ids) {
+  final selectedIds = ids.toSet();
+  return [
+    for (final member in trip.members)
+      if (selectedIds.contains(member.id)) member,
+  ];
+}
+
+List<TravelTrip> _sortTripsByTime(List<TravelTrip> trips) {
+  final sorted = [...trips];
+  sorted.sort((a, b) {
+    final aDate = a.startDate ?? a.endDate;
+    final bDate = b.startDate ?? b.endDate;
+    if (aDate == null && bDate == null) {
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    }
+    if (aDate == null) {
+      return 1;
+    }
+    if (bDate == null) {
+      return -1;
+    }
+
+    final dateOrder = aDate.compareTo(bDate);
+    if (dateOrder != 0) {
+      return dateOrder;
+    }
+    return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+  });
+
+  return sorted;
+}
+
 class TravelerApp extends StatelessWidget {
   const TravelerApp({super.key});
 
@@ -155,7 +219,7 @@ class TravelerApp extends StatelessWidget {
         ),
         useMaterial3: true,
         scaffoldBackgroundColor: const Color(0xFFF7F8F4),
-        appBarTheme: const AppBarTheme(centerTitle: false),
+        appBarTheme: const AppBarTheme(centerTitle: true),
         cardTheme: CardThemeData(
           elevation: 0,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
@@ -211,15 +275,16 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     }
 
     setState(() {
-      _trips = trips;
+      _trips = _sortTripsByTime(trips);
       _selectedTripId = null;
       _loading = false;
     });
   }
 
   Future<void> _persistTrips(List<TravelTrip> trips) async {
+    final sortedTrips = _sortTripsByTime(trips);
     setState(() {
-      _trips = trips;
+      _trips = sortedTrips;
       if (_trips.isEmpty) {
         _selectedTripId = null;
       } else if (!_trips.any((trip) => trip.id == _selectedTripId)) {
@@ -227,7 +292,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
       }
     });
 
-    await widget.repository.saveTrips(trips);
+    await widget.repository.saveTrips(sortedTrips);
   }
 
   Future<void> _upsertTrip(TravelTrip trip) async {
@@ -294,15 +359,32 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     }
 
     final memberIds = members.map((member) => member.id).toSet();
+    List<TravelAttachment> cleanAttachments(
+      List<TravelAttachment> attachments,
+    ) {
+      return attachments.map((attachment) {
+        return attachment.copyWith(
+          memberIds: attachment.memberIds.where(memberIds.contains).toList(),
+        );
+      }).toList();
+    }
+
     final events = trip.events.map((event) {
       return event.copyWith(
         expenseMemberIds: event.expenseMemberIds
             .where(memberIds.contains)
             .toList(),
+        attachments: cleanAttachments(event.attachments),
       );
     }).toList();
 
-    await _upsertTrip(trip.copyWith(members: members, events: events));
+    await _upsertTrip(
+      trip.copyWith(
+        members: members,
+        events: events,
+        attachments: cleanAttachments(trip.attachments),
+      ),
+    );
   }
 
   Future<void> _showEventDialog(
@@ -367,17 +449,42 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     await showDialog<void>(
       context: context,
       builder: (context) => EventFilesDialog(
+        trip: trip,
         event: event,
         onOpenAttachment: _openAttachment,
         onAttachFile: () => _pickAttachment(trip, event: event),
         onPickPhoto: (source) => _pickPhoto(trip, event, source),
         onRemoveAttachment: (attachment) =>
             _removeAttachment(trip, attachment, event),
+        onUpdateAttachmentMembers: (attachment, memberIds) =>
+            _updateAttachmentMembers(trip, event, attachment, memberIds),
       ),
     );
   }
 
   Future<void> _deleteEvent(TravelTrip trip, TravelEvent event) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete event'),
+        content: Text('Delete ${event.title}?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
     await _upsertTrip(
       trip.copyWith(
         events: trip.events
@@ -445,6 +552,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
       kind: AttachmentKind.file,
       sizeBytes: file.size,
       addedAt: DateTime.now(),
+      memberIds: const [],
     );
 
     await _addAttachmentToEvent(trip, targetEvent, attachment);
@@ -475,6 +583,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
         kind: AttachmentKind.photo,
         sizeBytes: bytes.length,
         addedAt: DateTime.now(),
+        memberIds: const [],
       );
 
       await _addAttachmentToEvent(trip, event, attachment);
@@ -516,6 +625,49 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
             .where((candidate) => candidate.id != attachment.id)
             .toList(),
       ),
+    );
+  }
+
+  Future<void> _updateAttachmentMembers(
+    TravelTrip trip,
+    TravelEvent? event,
+    TravelAttachment attachment,
+    Set<String> memberIds,
+  ) async {
+    final validMemberIds = trip.members.map((member) => member.id).toSet();
+    final selectedMemberIds = memberIds.where(validMemberIds.contains).toList();
+
+    List<TravelAttachment> updateAttachments(
+      List<TravelAttachment> attachments,
+    ) {
+      return attachments.map((candidate) {
+        if (candidate.id != attachment.id) {
+          return candidate;
+        }
+
+        return candidate.copyWith(memberIds: selectedMemberIds);
+      }).toList();
+    }
+
+    if (event != null) {
+      await _upsertTrip(
+        trip.copyWith(
+          events: trip.events.map((candidate) {
+            if (candidate.id != event.id) {
+              return candidate;
+            }
+
+            return candidate.copyWith(
+              attachments: updateAttachments(candidate.attachments),
+            );
+          }).toList(),
+        ),
+      );
+      return;
+    }
+
+    await _upsertTrip(
+      trip.copyWith(attachments: updateAttachments(trip.attachments)),
     );
   }
 
@@ -564,7 +716,17 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     final selectedTrip = isWide ? _selectedTrip ?? _firstTrip : _selectedTrip;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Traveler')),
+      appBar: AppBar(
+        title: const Text('Traveler'),
+        centerTitle: true,
+        actions: [
+          IconButton(
+            tooltip: 'New trip',
+            onPressed: () => _showTripDialog(),
+            icon: const Icon(Icons.add),
+          ),
+        ],
+      ),
       body: SafeArea(
         child: _trips.isEmpty
             ? EmptyTripsView(onCreate: () => _showTripDialog())
@@ -579,7 +741,8 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                       onSelect: (trip) {
                         setState(() => _selectedTripId = trip.id);
                       },
-                      onCreate: () => _showTripDialog(),
+                      onEdit: (trip) => _showTripDialog(trip: trip),
+                      onDelete: _deleteTrip,
                     ),
                   ),
                   const VerticalDivider(width: 1),
@@ -613,6 +776,14 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                                 event,
                               );
                             },
+                            onUpdateAttachmentMembers:
+                                (event, attachment, memberIds) =>
+                                    _updateAttachmentMembers(
+                                      selectedTrip,
+                                      event,
+                                      attachment,
+                                      memberIds,
+                                    ),
                           ),
                   ),
                 ],
@@ -624,7 +795,8 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                 onSelect: (trip) {
                   setState(() => _selectedTripId = trip.id);
                 },
-                onCreate: () => _showTripDialog(),
+                onEdit: (trip) => _showTripDialog(trip: trip),
+                onDelete: _deleteTrip,
               )
             : TripDetailView(
                 trip: selectedTrip,
@@ -646,6 +818,13 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                 onRemoveAttachment: (event, attachment) {
                   _removeAttachment(selectedTrip, attachment, event);
                 },
+                onUpdateAttachmentMembers: (event, attachment, memberIds) =>
+                    _updateAttachmentMembers(
+                      selectedTrip,
+                      event,
+                      attachment,
+                      memberIds,
+                    ),
               ),
       ),
     );
@@ -696,84 +875,68 @@ class TripListPane extends StatelessWidget {
     required this.trips,
     required this.selectedTripId,
     required this.onSelect,
-    required this.onCreate,
+    required this.onEdit,
+    required this.onDelete,
   });
 
   final List<TravelTrip> trips;
   final String? selectedTripId;
   final ValueChanged<TravelTrip> onSelect;
-  final VoidCallback onCreate;
+  final ValueChanged<TravelTrip> onEdit;
+  final ValueChanged<TravelTrip> onDelete;
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-          child: Row(
-            children: [
-              Expanded(
-                child: Text(
-                  'Trips',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-              ),
-              IconButton.filledTonal(
-                tooltip: 'New trip',
-                onPressed: onCreate,
-                icon: const Icon(Icons.add),
-              ),
-            ],
-          ),
-        ),
-        Expanded(
-          child: ListView.separated(
-            padding: const EdgeInsets.fromLTRB(12, 4, 12, 16),
-            itemCount: trips.length,
-            separatorBuilder: (context, index) => const SizedBox(height: 8),
-            itemBuilder: (context, index) {
-              final trip = trips[index];
-              final selected = trip.id == selectedTripId;
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(12, 16, 12, 16),
+      itemCount: trips.length,
+      separatorBuilder: (context, index) => const SizedBox(height: 8),
+      itemBuilder: (context, index) {
+        final trip = trips[index];
+        final selected = trip.id == selectedTripId;
+        final colors = Theme.of(context).colorScheme;
 
-              return Card(
-                color: selected
-                    ? Theme.of(context).colorScheme.primaryContainer
-                    : Theme.of(context).colorScheme.surface,
-                child: ListTile(
-                  selected: selected,
-                  onTap: () => onSelect(trip),
-                  leading: CircleAvatar(
-                    backgroundColor: selected
-                        ? Theme.of(context).colorScheme.primary
-                        : const Color(0xFFE76F51),
-                    foregroundColor: Colors.white,
-                    child: Text(
-                      trip.name.trim().isEmpty
-                          ? '?'
-                          : trip.name.trim().characters.first.toUpperCase(),
-                    ),
-                  ),
-                  title: Text(
-                    trip.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle: Text(
-                    [
-                      if (trip.country.isNotEmpty) trip.country,
-                      trip.targetCurrency,
-                      '${trip.events.length} events',
-                    ].join(' - '),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  trailing: const Icon(Icons.chevron_right),
-                ),
-              );
-            },
+        return Card(
+          clipBehavior: Clip.antiAlias,
+          color: selected ? colors.primaryContainer : colors.surface,
+          child: ListTile(
+            selected: selected,
+            onTap: () => onSelect(trip),
+            onLongPress: () => onEdit(trip),
+            leading: CircleAvatar(
+              backgroundColor: selected
+                  ? colors.primary
+                  : const Color(0xFFE76F51),
+              foregroundColor: Colors.white,
+              child: Text(
+                trip.name.trim().isEmpty
+                    ? '?'
+                    : trip.name.trim().characters.first.toUpperCase(),
+              ),
+            ),
+            title: Text(
+              trip.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            subtitle: Text(
+              [
+                trip.dateRangeLabel,
+                if (trip.country.isNotEmpty) trip.country,
+                trip.targetCurrency,
+                '${trip.events.length} events',
+              ].join(' - '),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            trailing: IconButton(
+              tooltip: 'Delete trip',
+              onPressed: () => onDelete(trip),
+              icon: const Icon(Icons.delete_outline),
+            ),
           ),
-        ),
-      ],
+        );
+      },
     );
   }
 }
@@ -793,6 +956,7 @@ class TripDetailView extends StatelessWidget {
     required this.onAddAttachment,
     required this.onOpenAttachment,
     required this.onRemoveAttachment,
+    required this.onUpdateAttachmentMembers,
     this.compact = false,
     this.onBack,
   });
@@ -811,6 +975,7 @@ class TripDetailView extends StatelessWidget {
   final ValueChanged<TravelEvent?> onAddAttachment;
   final ValueChanged<TravelAttachment> onOpenAttachment;
   final AttachmentAction onRemoveAttachment;
+  final AttachmentMemberAction onUpdateAttachmentMembers;
 
   @override
   Widget build(BuildContext context) {
@@ -852,6 +1017,7 @@ class TripDetailView extends StatelessWidget {
                   onAddAttachment: onAddAttachment,
                   onOpenAttachment: onOpenAttachment,
                   onRemoveAttachment: onRemoveAttachment,
+                  onUpdateAttachmentMembers: onUpdateAttachmentMembers,
                 ),
               ],
             ),
@@ -900,73 +1066,57 @@ class TripHeader extends StatelessWidget {
           else
             const SizedBox(width: 8),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  trip.name,
-                  style: theme.textTheme.headlineSmall?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 6),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 6,
+            child: InkWell(
+              onTap: onEdit,
+              borderRadius: BorderRadius.circular(8),
+              child: Padding(
+                padding: const EdgeInsets.all(8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    TripMetaChip(
-                      icon: Icons.place_outlined,
-                      label: trip.country.isEmpty ? 'No country' : trip.country,
+                    Text(
+                      trip.name,
+                      style: theme.textTheme.headlineSmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
                     ),
-                    TripMetaChip(
-                      icon: Icons.calendar_today_outlined,
-                      label: range,
-                    ),
-                    TripMetaChip(
-                      icon: Icons.group_outlined,
-                      label: '${trip.members.length} members',
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      children: [
+                        TripMetaChip(
+                          icon: Icons.place_outlined,
+                          label: trip.country.isEmpty
+                              ? 'No country'
+                              : trip.country,
+                        ),
+                        TripMetaChip(
+                          icon: Icons.calendar_today_outlined,
+                          label: range,
+                        ),
+                        TripMetaChip(
+                          icon: Icons.group_outlined,
+                          label: '${trip.members.length} members',
+                        ),
+                      ],
                     ),
                   ],
                 ),
-              ],
+              ),
             ),
           ),
-          PopupMenuButton<String>(
-            tooltip: 'Trip actions',
-            onSelected: (value) {
-              if (value == 'edit') {
-                onEdit();
-              } else if (value == 'members') {
-                onManageMembers();
-              } else if (value == 'delete') {
-                onDelete();
-              }
-            },
-            itemBuilder: (context) => const [
-              PopupMenuItem(
-                value: 'edit',
-                child: ListTile(
-                  leading: Icon(Icons.edit_outlined),
-                  title: Text('Edit trip'),
-                ),
-              ),
-              PopupMenuItem(
-                value: 'members',
-                child: ListTile(
-                  leading: Icon(Icons.group_outlined),
-                  title: Text('Members'),
-                ),
-              ),
-              PopupMenuItem(
-                value: 'delete',
-                child: ListTile(
-                  leading: Icon(Icons.delete_outline),
-                  title: Text('Delete trip'),
-                ),
-              ),
-            ],
+          IconButton(
+            tooltip: 'Trip members',
+            onPressed: onManageMembers,
+            icon: const Icon(Icons.group_outlined),
+          ),
+          IconButton(
+            tooltip: 'Delete trip',
+            onPressed: onDelete,
+            icon: const Icon(Icons.delete_outline),
           ),
         ],
       ),
@@ -1009,6 +1159,33 @@ class PlanTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final events = trip.sortedEvents;
+    final children = <Widget>[];
+    DateTime? currentDay;
+
+    for (var index = 0; index < events.length; index++) {
+      final event = events[index];
+      final day = DateTime(
+        event.startAt.year,
+        event.startAt.month,
+        event.startAt.day,
+      );
+      if (currentDay == null || !DateUtils.isSameDay(currentDay, day)) {
+        children.add(DaySeparator(date: day));
+        currentDay = day;
+      }
+
+      children.add(
+        TimelineEventCard(
+          trip: trip,
+          event: event,
+          isFirst: index == 0,
+          isLast: index == events.length - 1,
+          onOpenActions: () => onOpenEventActions(event),
+          onEdit: () => onEditEvent(event),
+          onDelete: () => onDeleteEvent(event),
+        ),
+      );
+    }
 
     return Stack(
       children: [
@@ -1020,21 +1197,9 @@ class PlanTab extends StatelessWidget {
             onAction: onAddEvent,
           )
         else
-          ListView.builder(
+          ListView(
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
-            itemCount: events.length,
-            itemBuilder: (context, index) {
-              final event = events[index];
-              return TimelineEventCard(
-                trip: trip,
-                event: event,
-                isFirst: index == 0,
-                isLast: index == events.length - 1,
-                onOpenActions: () => onOpenEventActions(event),
-                onEdit: () => onEditEvent(event),
-                onDelete: () => onDeleteEvent(event),
-              );
-            },
+            children: children,
           ),
         Positioned(
           right: 16,
@@ -1046,6 +1211,36 @@ class PlanTab extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+class DaySeparator extends StatelessWidget {
+  const DaySeparator({super.key, required this.date});
+
+  final DateTime date;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(0, 4, 0, 12),
+      child: Row(
+        children: [
+          const Expanded(child: Divider()),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Text(
+              _dayFormatter.format(date),
+              style: theme.textTheme.labelLarge?.copyWith(
+                fontWeight: FontWeight.w700,
+                color: theme.colorScheme.primary,
+              ),
+            ),
+          ),
+          const Expanded(child: Divider()),
+        ],
+      ),
     );
   }
 }
@@ -1119,7 +1314,8 @@ class TimelineEventCard extends StatelessWidget {
             child: Card(
               margin: const EdgeInsets.only(bottom: 12),
               child: InkWell(
-                onTap: onOpenActions,
+                onTap: onEdit,
+                onLongPress: onOpenActions,
                 borderRadius: BorderRadius.circular(8),
                 child: Padding(
                   padding: const EdgeInsets.all(16),
@@ -1147,31 +1343,10 @@ class TimelineEventCard extends StatelessWidget {
                               ],
                             ),
                           ),
-                          PopupMenuButton<String>(
-                            tooltip: 'Event actions',
-                            onSelected: (value) {
-                              if (value == 'edit') {
-                                onEdit();
-                              } else if (value == 'delete') {
-                                onDelete();
-                              }
-                            },
-                            itemBuilder: (context) => const [
-                              PopupMenuItem(
-                                value: 'edit',
-                                child: ListTile(
-                                  leading: Icon(Icons.edit_outlined),
-                                  title: Text('Edit'),
-                                ),
-                              ),
-                              PopupMenuItem(
-                                value: 'delete',
-                                child: ListTile(
-                                  leading: Icon(Icons.delete_outline),
-                                  title: Text('Delete'),
-                                ),
-                              ),
-                            ],
+                          IconButton(
+                            tooltip: 'Delete event',
+                            onPressed: onDelete,
+                            icon: const Icon(Icons.delete_outline),
                           ),
                         ],
                       ),
@@ -1204,7 +1379,10 @@ class TimelineEventCard extends StatelessWidget {
                                 size: 18,
                               ),
                               label: Text(
-                                '${trip.targetCurrency} ${_moneyFormatter.format(event.expenseAmount)}',
+                                _formatMoney(
+                                  event.expenseCurrencyCode,
+                                  event.expenseAmount,
+                                ),
                               ),
                               visualDensity: VisualDensity.compact,
                             ),
@@ -1273,7 +1451,7 @@ class EventActionsSheet extends StatelessWidget {
             ActionTile(
               icon: Icons.receipt_long_outlined,
               title: 'Expense',
-              subtitle: 'Amount and split count',
+              subtitle: 'Amount, currency, and split count',
               onTap: () => Navigator.of(context).pop(EventAction.expense),
             ),
             ActionTile(
@@ -1367,8 +1545,8 @@ class ExpenseSummaryCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final totalTarget = trip.totalExpense;
-    final totalMyr = totalTarget * trip.exchangeRateToMyr;
+    final totalTarget = trip.totalExpenseInTripCurrency;
+    final totalMyr = trip.totalExpenseInMyr;
 
     return Card(
       color: const Color(0xFFFFF4E8),
@@ -1388,7 +1566,7 @@ class ExpenseSummaryCard extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    '${trip.targetCurrency} ${_moneyFormatter.format(totalTarget)}',
+                    _formatMoney(trip.targetCurrency, totalTarget),
                     style: Theme.of(context).textTheme.headlineSmall?.copyWith(
                       fontWeight: FontWeight.w800,
                     ),
@@ -1421,9 +1599,11 @@ class JournalEventCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final perPerson = event.splitCount <= 1
         ? event.expenseAmount
         : event.expenseAmount / event.splitCount;
+    final splitMembers = _membersForIds(trip, event.expenseMemberIds);
 
     return Card(
       child: InkWell(
@@ -1431,64 +1611,109 @@ class JournalEventCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
         child: Padding(
           padding: const EdgeInsets.all(16),
-          child: Column(
+          child: Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      event.title,
-                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w700,
+              SizedBox(
+                width: 82,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _shortDayFormatter.format(event.startAt),
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
                       ),
                     ),
-                  ),
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      Text(_shortDayFormatter.format(event.startAt)),
-                      const SizedBox(height: 2),
-                      Text(
-                        event.timeRangeLabel,
-                        style: Theme.of(context).textTheme.bodySmall,
+                    const SizedBox(height: 4),
+                    Text(
+                      event.timeRangeLabel,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Wrap(
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      spacing: 8,
+                      runSpacing: 6,
+                      children: [
+                        Text(
+                          event.title,
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        if (event.feeling.isNotEmpty)
+                          Chip(
+                            avatar: const Icon(Icons.favorite_border, size: 18),
+                            label: Text(event.feeling),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                      ],
+                    ),
+                    if (event.expenseAmount > 0) ...[
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 6,
+                        children: [
+                          Chip(
+                            avatar: const Icon(
+                              Icons.payments_outlined,
+                              size: 18,
+                            ),
+                            label: Text(
+                              _formatMoney(
+                                event.expenseCurrencyCode,
+                                event.expenseAmount,
+                              ),
+                            ),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          if (event.splitCount > 1)
+                            Chip(
+                              avatar: const Icon(
+                                Icons.group_outlined,
+                                size: 18,
+                              ),
+                              label: Text(
+                                '${_formatMoney(event.expenseCurrencyCode, perPerson)} each',
+                              ),
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          for (final member in splitMembers)
+                            Chip(
+                              avatar: const Icon(
+                                Icons.person_outline,
+                                size: 18,
+                              ),
+                              label: Text(member.name),
+                              visualDensity: VisualDensity.compact,
+                            ),
+                        ],
                       ),
                     ],
-                  ),
-                ],
-              ),
-              if (event.journal.isNotEmpty) ...[
-                const SizedBox(height: 10),
-                Text(event.journal),
-              ],
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 8,
-                runSpacing: 6,
-                children: [
-                  if (event.feeling.isNotEmpty)
-                    Chip(
-                      avatar: const Icon(Icons.favorite_border, size: 18),
-                      label: Text(event.feeling),
-                      visualDensity: VisualDensity.compact,
-                    ),
-                  if (event.expenseAmount > 0)
-                    Chip(
-                      avatar: const Icon(Icons.payments_outlined, size: 18),
-                      label: Text(
-                        '${trip.targetCurrency} ${_moneyFormatter.format(event.expenseAmount)}',
+                    if (event.journal.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      Text(event.journal),
+                    ],
+                    if (event.location.isNotEmpty) ...[
+                      const SizedBox(height: 10),
+                      IconLine(
+                        icon: Icons.place_outlined,
+                        text: event.location,
                       ),
-                      visualDensity: VisualDensity.compact,
-                    ),
-                  if (event.splitCount > 1)
-                    Chip(
-                      avatar: const Icon(Icons.group_outlined, size: 18),
-                      label: Text(
-                        '${trip.targetCurrency} ${_moneyFormatter.format(perPerson)} each',
-                      ),
-                      visualDensity: VisualDensity.compact,
-                    ),
-                ],
+                    ],
+                  ],
+                ),
               ),
             ],
           ),
@@ -1757,81 +1982,203 @@ class _CurrencyTabState extends State<CurrencyTab> {
   }
 }
 
-class FilesTab extends StatelessWidget {
+class FilesTab extends StatefulWidget {
   const FilesTab({
     super.key,
     required this.trip,
     required this.onAddAttachment,
     required this.onOpenAttachment,
     required this.onRemoveAttachment,
+    required this.onUpdateAttachmentMembers,
   });
 
   final TravelTrip trip;
   final ValueChanged<TravelEvent?> onAddAttachment;
   final ValueChanged<TravelAttachment> onOpenAttachment;
   final AttachmentAction onRemoveAttachment;
+  final AttachmentMemberAction onUpdateAttachmentMembers;
+
+  @override
+  State<FilesTab> createState() => _FilesTabState();
+}
+
+class _FilesTabState extends State<FilesTab> {
+  String? _selectedMemberId;
+
+  Future<void> _editPinnedMembers(AttachmentListItem item) async {
+    final memberIds = await showDialog<Set<String>>(
+      context: context,
+      builder: (context) => AttachmentMembersDialog(
+        attachment: item.attachment,
+        members: widget.trip.members,
+      ),
+    );
+
+    if (memberIds == null) {
+      return;
+    }
+
+    await widget.onUpdateAttachmentMembers(
+      item.event,
+      item.attachment,
+      memberIds,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    final items = [
-      for (final attachment in trip.attachments)
+    final activeMemberId =
+        widget.trip.members.any((member) => member.id == _selectedMemberId)
+        ? _selectedMemberId
+        : null;
+    final allItems = [
+      for (final attachment in widget.trip.attachments)
         AttachmentListItem(event: null, attachment: attachment),
-      for (final event in trip.sortedEvents)
+      for (final event in widget.trip.sortedEvents)
         for (final attachment in event.attachments)
           AttachmentListItem(event: event, attachment: attachment),
     ];
+    final items = activeMemberId == null
+        ? allItems
+        : allItems
+              .where(
+                (item) => item.attachment.memberIds.contains(activeMemberId),
+              )
+              .toList();
 
-    if (items.isEmpty) {
+    if (allItems.isEmpty) {
       return EmptyTabView(
         icon: Icons.folder_open_outlined,
-        title: trip.events.isEmpty ? 'No events yet' : 'No files yet',
-        actionLabel: trip.events.isEmpty ? null : 'Attach to event',
-        onAction: trip.events.isEmpty ? null : () => onAddAttachment(null),
+        title: widget.trip.events.isEmpty ? 'No events yet' : 'No files yet',
+        actionLabel: widget.trip.events.isEmpty ? null : 'Attach to event',
+        onAction: widget.trip.events.isEmpty
+            ? null
+            : () => widget.onAddAttachment(null),
       );
     }
 
-    return ListView.separated(
+    return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-      itemCount: items.length + 1,
-      separatorBuilder: (context, index) => const SizedBox(height: 8),
-      itemBuilder: (context, index) {
-        if (index == 0) {
-          return Align(
-            alignment: Alignment.centerLeft,
-            child: FilledButton.icon(
-              onPressed: () => onAddAttachment(null),
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            FilledButton.icon(
+              onPressed: () => widget.onAddAttachment(null),
               icon: const Icon(Icons.attach_file),
               label: const Text('Attach to event'),
             ),
-          );
-        }
-
-        final item = items[index - 1];
-        final attachment = item.attachment;
-        return Card(
-          child: ListTile(
-            leading: const Icon(Icons.insert_drive_file_outlined),
-            title: Text(
-              attachment.name,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
+            if (widget.trip.members.isNotEmpty)
+              ChoiceChip(
+                label: const Text('All'),
+                selected: activeMemberId == null,
+                onSelected: (_) => setState(() => _selectedMemberId = null),
+              ),
+            for (final member in widget.trip.members)
+              ChoiceChip(
+                avatar: const Icon(Icons.person_outline, size: 18),
+                label: Text(member.name),
+                selected: activeMemberId == member.id,
+                onSelected: (_) =>
+                    setState(() => _selectedMemberId = member.id),
+              ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        if (items.isEmpty)
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                activeMemberId == null
+                    ? 'No files yet'
+                    : 'No files pinned to this traveler',
+              ),
             ),
-            subtitle: Text(
+          )
+        else
+          for (final item in items) ...[
+            _AttachmentCard(
+              trip: widget.trip,
+              item: item,
+              onOpenAttachment: widget.onOpenAttachment,
+              onRemoveAttachment: widget.onRemoveAttachment,
+              onEditPinnedMembers: _editPinnedMembers,
+            ),
+            const SizedBox(height: 8),
+          ],
+      ],
+    );
+  }
+}
+
+class _AttachmentCard extends StatelessWidget {
+  const _AttachmentCard({
+    required this.trip,
+    required this.item,
+    required this.onOpenAttachment,
+    required this.onRemoveAttachment,
+    required this.onEditPinnedMembers,
+  });
+
+  final TravelTrip trip;
+  final AttachmentListItem item;
+  final ValueChanged<TravelAttachment> onOpenAttachment;
+  final AttachmentAction onRemoveAttachment;
+  final ValueChanged<AttachmentListItem> onEditPinnedMembers;
+
+  @override
+  Widget build(BuildContext context) {
+    final attachment = item.attachment;
+    final pinnedMembers = _membersForIds(trip, attachment.memberIds);
+
+    return Card(
+      child: ListTile(
+        leading: Icon(
+          attachment.kind == AttachmentKind.photo
+              ? Icons.image_outlined
+              : Icons.insert_drive_file_outlined,
+        ),
+        title: Text(
+          attachment.name,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
               [
                 item.event?.title ?? 'Trip file',
                 _formatBytes(attachment.sizeBytes),
                 _shortDayFormatter.format(attachment.addedAt),
               ].join(' - '),
             ),
-            onTap: () => onOpenAttachment(attachment),
-            trailing: IconButton(
-              tooltip: 'Remove file',
-              onPressed: () => onRemoveAttachment(item.event, attachment),
-              icon: const Icon(Icons.delete_outline),
-            ),
+            MemberTagWrap(members: pinnedMembers),
+          ],
+        ),
+        onTap: () => onOpenAttachment(attachment),
+        trailing: SizedBox(
+          width: 96,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              IconButton(
+                tooltip: 'Pin members',
+                onPressed: () => onEditPinnedMembers(item),
+                icon: const Icon(Icons.person_pin_outlined),
+              ),
+              IconButton(
+                tooltip: 'Remove file',
+                onPressed: () => onRemoveAttachment(item.event, attachment),
+                icon: const Icon(Icons.delete_outline),
+              ),
+            ],
           ),
-        );
-      },
+        ),
+      ),
     );
   }
 }
@@ -1879,21 +2226,155 @@ class AttachmentTargetDialog extends StatelessWidget {
   }
 }
 
+class AttachmentMembersDialog extends StatefulWidget {
+  const AttachmentMembersDialog({
+    super.key,
+    required this.attachment,
+    required this.members,
+  });
+
+  final TravelAttachment attachment;
+  final List<TravelMember> members;
+
+  @override
+  State<AttachmentMembersDialog> createState() =>
+      _AttachmentMembersDialogState();
+}
+
+class _AttachmentMembersDialogState extends State<AttachmentMembersDialog> {
+  late Set<String> _selectedMemberIds;
+
+  @override
+  void initState() {
+    super.initState();
+    final validMemberIds = widget.members.map((member) => member.id).toSet();
+    _selectedMemberIds = widget.attachment.memberIds
+        .where(validMemberIds.contains)
+        .toSet();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Pin to travelers'),
+      content: SizedBox(
+        width: min(MediaQuery.sizeOf(context).width - 48, 420),
+        child: widget.members.isEmpty
+            ? const Text('Add travelers before pinning files.')
+            : Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final member in widget.members)
+                    FilterChip(
+                      avatar: const Icon(Icons.person_outline, size: 18),
+                      label: Text(member.name),
+                      selected: _selectedMemberIds.contains(member.id),
+                      onSelected: (selected) {
+                        setState(() {
+                          if (selected) {
+                            _selectedMemberIds.add(member.id);
+                          } else {
+                            _selectedMemberIds.remove(member.id);
+                          }
+                        });
+                      },
+                    ),
+                ],
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(<String>{}),
+          child: const Text('Clear'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(_selectedMemberIds),
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
+class MemberTagWrap extends StatelessWidget {
+  const MemberTagWrap({super.key, required this.members});
+
+  final List<TravelMember> members;
+
+  @override
+  Widget build(BuildContext context) {
+    if (members.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Wrap(
+        spacing: 6,
+        runSpacing: 4,
+        children: [
+          for (final member in members)
+            Chip(
+              avatar: const Icon(Icons.person_outline, size: 16),
+              label: Text(member.name),
+              visualDensity: VisualDensity.compact,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 class EventFilesDialog extends StatelessWidget {
   const EventFilesDialog({
     super.key,
+    required this.trip,
     required this.event,
     required this.onOpenAttachment,
     required this.onAttachFile,
     required this.onPickPhoto,
     required this.onRemoveAttachment,
+    required this.onUpdateAttachmentMembers,
   });
 
+  final TravelTrip trip;
   final TravelEvent event;
   final ValueChanged<TravelAttachment> onOpenAttachment;
   final Future<void> Function() onAttachFile;
   final Future<void> Function(ImageSource source) onPickPhoto;
   final Future<void> Function(TravelAttachment attachment) onRemoveAttachment;
+  final Future<void> Function(
+    TravelAttachment attachment,
+    Set<String> memberIds,
+  )
+  onUpdateAttachmentMembers;
+
+  Future<void> _editPinnedMembers(
+    BuildContext context,
+    TravelAttachment attachment,
+  ) async {
+    final memberIds = await showDialog<Set<String>>(
+      context: context,
+      builder: (context) => AttachmentMembersDialog(
+        attachment: attachment,
+        members: trip.members,
+      ),
+    );
+
+    if (memberIds == null) {
+      return;
+    }
+
+    await onUpdateAttachmentMembers(attachment, memberIds);
+    if (context.mounted) {
+      Navigator.of(context).pop();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1955,6 +2436,10 @@ class EventFilesDialog extends StatelessWidget {
                       const Divider(height: 1),
                   itemBuilder: (context, index) {
                     final attachment = event.attachments[index];
+                    final pinnedMembers = _membersForIds(
+                      trip,
+                      attachment.memberIds,
+                    );
                     return ListTile(
                       leading: Icon(
                         attachment.kind == AttachmentKind.photo
@@ -1966,19 +2451,39 @@ class EventFilesDialog extends StatelessWidget {
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                       ),
-                      subtitle: Text(
-                        '${_attachmentKindName(attachment.kind)} - ${_formatBytes(attachment.sizeBytes)}',
+                      subtitle: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '${_attachmentKindName(attachment.kind)} - ${_formatBytes(attachment.sizeBytes)}',
+                          ),
+                          MemberTagWrap(members: pinnedMembers),
+                        ],
                       ),
                       onTap: () => onOpenAttachment(attachment),
-                      trailing: IconButton(
-                        tooltip: 'Remove',
-                        onPressed: () async {
-                          await onRemoveAttachment(attachment);
-                          if (context.mounted) {
-                            Navigator.of(context).pop();
-                          }
-                        },
-                        icon: const Icon(Icons.delete_outline),
+                      trailing: SizedBox(
+                        width: 96,
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.end,
+                          children: [
+                            IconButton(
+                              tooltip: 'Pin members',
+                              onPressed: () =>
+                                  _editPinnedMembers(context, attachment),
+                              icon: const Icon(Icons.person_pin_outlined),
+                            ),
+                            IconButton(
+                              tooltip: 'Remove',
+                              onPressed: () async {
+                                await onRemoveAttachment(attachment);
+                                if (context.mounted) {
+                                  Navigator.of(context).pop();
+                                }
+                              },
+                              icon: const Icon(Icons.delete_outline),
+                            ),
+                          ],
+                        ),
                       ),
                     );
                   },
@@ -2516,6 +3021,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
   late TimeOfDay _endTime;
   late bool _isFlexible;
   var _expenseInputMode = ExpenseInputMode.total;
+  late String _selectedExpenseCurrency;
   late Set<String> _selectedExpenseMemberIds;
 
   @override
@@ -2545,6 +3051,9 @@ class _EventFormDialogState extends State<EventFormDialog> {
       startAt.add(Duration(minutes: event?.durationMinutes ?? 60)),
     );
     _isFlexible = event?.isFlexible ?? false;
+    _selectedExpenseCurrency = _currencyForCode(
+      event?.expenseCurrencyCode ?? widget.trip.targetCurrency,
+    ).code;
     _selectedExpenseMemberIds = {...?event?.expenseMemberIds};
   }
 
@@ -2639,6 +3148,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
         journal: _journalController.text.trim(),
         feeling: _feelingController.text.trim(),
         expenseAmount: expense,
+        expenseCurrencyCode: _selectedExpenseCurrency,
         splitCount: max(1, split),
         isFlexible: _isFlexible,
         attachments: widget.event?.attachments ?? const [],
@@ -2786,11 +3296,31 @@ class _EventFormDialogState extends State<EventFormDialog> {
                     },
                   ),
                   const SizedBox(height: 12),
+                  DropdownButtonFormField<String>(
+                    initialValue: _selectedExpenseCurrency,
+                    decoration: const InputDecoration(
+                      labelText: 'Expense currency',
+                      prefixIcon: Icon(Icons.payments_outlined),
+                    ),
+                    items: [
+                      for (final currency in _supportedCurrencies)
+                        DropdownMenuItem(
+                          value: currency.code,
+                          child: Text(currency.label),
+                        ),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) {
+                        setState(() => _selectedExpenseCurrency = value);
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 12),
                   TextFormField(
                     controller: _expenseController,
                     decoration: InputDecoration(
                       labelText:
-                          '${_expenseInputMode == ExpenseInputMode.total ? 'Total' : 'Per pax'} ${widget.trip.targetCurrency}',
+                          '${_expenseInputMode == ExpenseInputMode.total ? 'Total' : 'Per pax'} $_selectedExpenseCurrency',
                       prefixIcon: const Icon(Icons.receipt_long_outlined),
                     ),
                     keyboardType: const TextInputType.numberWithOptions(
@@ -2947,21 +3477,26 @@ class TravelTrip {
   });
 
   factory TravelTrip.fromJson(Map<String, Object?> json) {
+    final targetCurrency = json['targetCurrency'] as String? ?? 'CNY';
+
     return TravelTrip(
       id: json['id'] as String? ?? _newId('trip'),
       name: json['name'] as String? ?? 'Untitled trip',
       country: json['country'] as String? ?? '',
-      targetCurrency: json['targetCurrency'] as String? ?? 'CNY',
+      targetCurrency: targetCurrency,
       exchangeRateToMyr:
           (json['exchangeRateToMyr'] as num?)?.toDouble() ??
-          _currencyForCode(
-            json['targetCurrency'] as String? ?? 'CNY',
-          ).fallbackRateToMyr,
+          _currencyForCode(targetCurrency).fallbackRateToMyr,
       startDate: _parseOptionalDate(json['startDate']),
       endDate: _parseOptionalDate(json['endDate']),
       events: (json['events'] as List? ?? const [])
           .whereType<Map<String, Object?>>()
-          .map(TravelEvent.fromJson)
+          .map(
+            (event) => TravelEvent.fromJson(
+              event,
+              fallbackExpenseCurrencyCode: targetCurrency,
+            ),
+          )
           .toList(),
       attachments: (json['attachments'] as List? ?? const [])
           .whereType<Map<String, Object?>>()
@@ -2991,10 +3526,17 @@ class TravelTrip {
     return sorted;
   }
 
-  double get totalExpense {
+  double get totalExpenseInTripCurrency {
     return events.fold<double>(
       0,
-      (total, event) => total + event.expenseAmount,
+      (total, event) => total + _expenseAmountInTripCurrency(this, event),
+    );
+  }
+
+  double get totalExpenseInMyr {
+    return events.fold<double>(
+      0,
+      (total, event) => total + _expenseAmountInMyr(this, event),
     );
   }
 
@@ -3082,13 +3624,17 @@ class TravelEvent {
     required this.journal,
     required this.feeling,
     required this.expenseAmount,
+    required this.expenseCurrencyCode,
     required this.splitCount,
     required this.isFlexible,
     required this.attachments,
     required this.expenseMemberIds,
   });
 
-  factory TravelEvent.fromJson(Map<String, Object?> json) {
+  factory TravelEvent.fromJson(
+    Map<String, Object?> json, {
+    String fallbackExpenseCurrencyCode = 'CNY',
+  }) {
     return TravelEvent(
       id: json['id'] as String? ?? _newId('event'),
       title: json['title'] as String? ?? 'Untitled event',
@@ -3100,6 +3646,9 @@ class TravelEvent {
       journal: json['journal'] as String? ?? '',
       feeling: json['feeling'] as String? ?? '',
       expenseAmount: (json['expenseAmount'] as num?)?.toDouble() ?? 0,
+      expenseCurrencyCode: _currencyForCode(
+        json['expenseCurrencyCode'] as String? ?? fallbackExpenseCurrencyCode,
+      ).code,
       splitCount: (json['splitCount'] as num?)?.toInt() ?? 1,
       isFlexible: json['isFlexible'] as bool? ?? false,
       attachments: (json['attachments'] as List? ?? const [])
@@ -3121,6 +3670,7 @@ class TravelEvent {
   final String journal;
   final String feeling;
   final double expenseAmount;
+  final String expenseCurrencyCode;
   final int splitCount;
   final bool isFlexible;
   final List<TravelAttachment> attachments;
@@ -3145,6 +3695,7 @@ class TravelEvent {
     String? journal,
     String? feeling,
     double? expenseAmount,
+    String? expenseCurrencyCode,
     int? splitCount,
     bool? isFlexible,
     List<TravelAttachment>? attachments,
@@ -3160,6 +3711,7 @@ class TravelEvent {
       journal: journal ?? this.journal,
       feeling: feeling ?? this.feeling,
       expenseAmount: expenseAmount ?? this.expenseAmount,
+      expenseCurrencyCode: expenseCurrencyCode ?? this.expenseCurrencyCode,
       splitCount: splitCount ?? this.splitCount,
       isFlexible: isFlexible ?? this.isFlexible,
       attachments: attachments ?? this.attachments,
@@ -3178,6 +3730,7 @@ class TravelEvent {
       'journal': journal,
       'feeling': feeling,
       'expenseAmount': expenseAmount,
+      'expenseCurrencyCode': expenseCurrencyCode,
       'splitCount': splitCount,
       'isFlexible': isFlexible,
       'attachments': attachments
@@ -3198,6 +3751,7 @@ class TravelAttachment {
     required this.kind,
     required this.sizeBytes,
     required this.addedAt,
+    required this.memberIds,
   });
 
   factory TravelAttachment.fromJson(Map<String, Object?> json) {
@@ -3214,6 +3768,9 @@ class TravelAttachment {
       sizeBytes: (json['sizeBytes'] as num?)?.toInt() ?? 0,
       addedAt:
           DateTime.tryParse(json['addedAt'] as String? ?? '') ?? DateTime.now(),
+      memberIds: (json['memberIds'] as List? ?? const [])
+          .whereType<String>()
+          .toList(),
     );
   }
 
@@ -3225,6 +3782,21 @@ class TravelAttachment {
   final AttachmentKind kind;
   final int sizeBytes;
   final DateTime addedAt;
+  final List<String> memberIds;
+
+  TravelAttachment copyWith({List<String>? memberIds}) {
+    return TravelAttachment(
+      id: id,
+      name: name,
+      path: path,
+      bytesBase64: bytesBase64,
+      mimeType: mimeType,
+      kind: kind,
+      sizeBytes: sizeBytes,
+      addedAt: addedAt,
+      memberIds: memberIds ?? this.memberIds,
+    );
+  }
 
   Map<String, Object?> toJson() {
     return {
@@ -3236,6 +3808,7 @@ class TravelAttachment {
       'kind': kind.name,
       'sizeBytes': sizeBytes,
       'addedAt': addedAt.toIso8601String(),
+      'memberIds': memberIds,
     };
   }
 }
