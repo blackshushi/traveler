@@ -1725,10 +1725,7 @@ class JournalEventCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final perPerson = event.splitCount <= 1
-        ? event.expenseAmount
-        : event.expenseAmount / event.splitCount;
-    final splitMembers = _membersForIds(trip, event.expenseMemberIds);
+    final colors = theme.colorScheme;
 
     return Card(
       child: InkWell(
@@ -1765,70 +1762,64 @@ class JournalEventCard extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Wrap(
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      spacing: 8,
-                      runSpacing: 6,
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          event.title,
-                          style: theme.textTheme.titleMedium?.copyWith(
-                            fontWeight: FontWeight.w700,
+                        Expanded(
+                          child: Text(
+                            event.title,
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w700,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
                           ),
                         ),
                         if (event.feeling.isNotEmpty)
-                          Chip(
-                            avatar: const Icon(Icons.favorite_border, size: 18),
-                            label: Text(event.feeling),
-                            visualDensity: VisualDensity.compact,
+                          Padding(
+                            padding: const EdgeInsets.only(left: 8),
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                color: colors.primaryContainer,
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 5,
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      Icons.favorite_border,
+                                      size: 16,
+                                      color: colors.onPrimaryContainer,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      event.feeling,
+                                      style: theme.textTheme.labelMedium
+                                          ?.copyWith(
+                                            color: colors.onPrimaryContainer,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
                           ),
                       ],
                     ),
-                    if (event.expenseAmount > 0) ...[
-                      const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 6,
-                        children: [
-                          Chip(
-                            avatar: const Icon(
-                              Icons.payments_outlined,
-                              size: 18,
-                            ),
-                            label: Text(
-                              _formatMoney(
-                                event.expenseCurrencyCode,
-                                event.expenseAmount,
-                              ),
-                            ),
-                            visualDensity: VisualDensity.compact,
-                          ),
-                          if (event.splitCount > 1)
-                            Chip(
-                              avatar: const Icon(
-                                Icons.group_outlined,
-                                size: 18,
-                              ),
-                              label: Text(
-                                '${_formatMoney(event.expenseCurrencyCode, perPerson)} each',
-                              ),
-                              visualDensity: VisualDensity.compact,
-                            ),
-                          for (final member in splitMembers)
-                            Chip(
-                              avatar: const Icon(
-                                Icons.person_outline,
-                                size: 18,
-                              ),
-                              label: Text(member.name),
-                              visualDensity: VisualDensity.compact,
-                            ),
-                        ],
-                      ),
-                    ],
                     if (event.journal.isNotEmpty) ...[
-                      const SizedBox(height: 10),
-                      Text(event.journal),
+                      const SizedBox(height: 8),
+                      Text(
+                        event.journal,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: colors.onSurfaceVariant,
+                          height: 1.25,
+                        ),
+                      ),
                     ],
                     if (event.location.isNotEmpty) ...[
                       const SizedBox(height: 10),
@@ -1837,12 +1828,123 @@ class JournalEventCard extends StatelessWidget {
                         text: event.location,
                       ),
                     ],
+                    if (event.expenseAmount > 0) ...[
+                      const SizedBox(height: 12),
+                      JournalBillPanel(trip: trip, event: event),
+                    ],
                   ],
                 ),
               ),
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+class JournalBillPanel extends StatelessWidget {
+  const JournalBillPanel({super.key, required this.trip, required this.event});
+
+  final TravelTrip trip;
+  final TravelEvent event;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final perPerson = event.splitCount <= 1
+        ? event.expenseAmount
+        : event.expenseAmount / event.splitCount;
+    final splitMembers = _membersForIds(trip, event.expenseMemberIds);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFF7ED),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: colors.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.receipt_long_outlined,
+                size: 20,
+                color: colors.primary,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Bill',
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    color: colors.onSurfaceVariant,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              Text(
+                _formatMoney(event.expenseCurrencyCode, event.expenseAmount),
+                style: theme.textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+          if (event.splitCount > 1 || splitMembers.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                if (event.splitCount > 1)
+                  _JournalBillPill(
+                    icon: Icons.group_outlined,
+                    text:
+                        '${_formatMoney(event.expenseCurrencyCode, perPerson)} each',
+                  ),
+                for (final member in splitMembers)
+                  _JournalBillPill(
+                    icon: Icons.person_outline,
+                    text: member.name,
+                  ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _JournalBillPill extends StatelessWidget {
+  const _JournalBillPill({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+      decoration: BoxDecoration(
+        color: colors.surface,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: colors.outlineVariant),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16, color: colors.primary),
+          const SizedBox(width: 5),
+          Text(text, style: Theme.of(context).textTheme.labelMedium),
+        ],
       ),
     );
   }
