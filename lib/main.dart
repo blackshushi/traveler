@@ -50,6 +50,9 @@ typedef AttachmentAction =
 typedef AttachmentPickAction =
     Future<TravelAttachment?> Function(TravelEvent? event);
 
+typedef AttachmentPhotoPickAction =
+    Future<TravelAttachment?> Function(TravelEvent? event, ImageSource source);
+
 typedef AttachmentMemberAction =
     Future<void> Function(
       TravelEvent? event,
@@ -173,6 +176,33 @@ Uint8List? _attachmentBytes(TravelAttachment attachment) {
   }
 }
 
+Future<ImageSource?> _showPhotoSourceSheet(BuildContext context) {
+  return showModalBottomSheet<ImageSource>(
+    context: context,
+    showDragHandle: true,
+    builder: (context) => SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Gallery'),
+              onTap: () => Navigator.of(context).pop(ImageSource.gallery),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined),
+              title: const Text('Camera'),
+              onTap: () => Navigator.of(context).pop(ImageSource.camera),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
 String _formatMoney(String code, double amount) {
   return '${_currencyForCode(code).code} ${_moneyFormatter.format(amount)}';
 }
@@ -196,10 +226,15 @@ double _expenseAmountInTripCurrency(TravelTrip trip, TravelEvent event) {
   return _expenseAmountInMyr(trip, event) / targetRate;
 }
 
+bool _memberIdsIncludeEveryTripMember(TravelTrip trip, Iterable<String> ids) {
+  final selectedIds = ids.toSet();
+  return trip.members.isNotEmpty &&
+      trip.members.every((member) => selectedIds.contains(member.id));
+}
+
 List<String> _memberTagLabelsForIds(TravelTrip trip, Iterable<String> ids) {
   final selectedIds = ids.toSet();
-  if (trip.members.isNotEmpty &&
-      trip.members.every((member) => selectedIds.contains(member.id))) {
+  if (_memberIdsIncludeEveryTripMember(trip, selectedIds)) {
     return const ['All'];
   }
 
@@ -762,9 +797,26 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
 
   Future<TravelAttachment?> _pickPhoto(
     TravelTrip trip,
-    TravelEvent event,
+    TravelEvent? event,
     ImageSource source,
   ) async {
+    var targetEvent = event;
+    if (targetEvent == null) {
+      if (trip.events.isEmpty) {
+        _showSnack('Create an event before attaching photos.');
+        return null;
+      }
+
+      targetEvent = await showDialog<TravelEvent>(
+        context: context,
+        builder: (context) => AttachmentTargetDialog(events: trip.sortedEvents),
+      );
+
+      if (targetEvent == null || !mounted) {
+        return null;
+      }
+    }
+
     try {
       final photo = await ImagePicker().pickImage(
         source: source,
@@ -798,7 +850,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
         memberIds: const [],
       );
 
-      return _addAttachmentToEvent(trip, event, attachment);
+      return _addAttachmentToEvent(trip, targetEvent, attachment);
     } on Object {
       if (!mounted) {
         return null;
@@ -1057,6 +1109,8 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                             onTripChanged: _upsertTrip,
                             onAddAttachment: (event) =>
                                 _pickAttachment(selectedTrip, event: event),
+                            onPickPhoto: (event, source) =>
+                                _pickPhoto(selectedTrip, event, source),
                             onOpenAttachment: _openAttachment,
                             onRemoveAttachment: (event, attachment) =>
                                 _removeAttachment(
@@ -1103,6 +1157,8 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                 onTripChanged: _upsertTrip,
                 onAddAttachment: (event) =>
                     _pickAttachment(selectedTrip, event: event),
+                onPickPhoto: (event, source) =>
+                    _pickPhoto(selectedTrip, event, source),
                 onOpenAttachment: _openAttachment,
                 onRemoveAttachment: (event, attachment) =>
                     _removeAttachment(selectedTrip, attachment, event),
@@ -1317,6 +1373,7 @@ class TripDetailView extends StatefulWidget {
     required this.onRenameEvent,
     required this.onTripChanged,
     required this.onAddAttachment,
+    required this.onPickPhoto,
     required this.onOpenAttachment,
     required this.onRemoveAttachment,
     required this.onUpdateAttachmentMembers,
@@ -1334,6 +1391,7 @@ class TripDetailView extends StatefulWidget {
   final ValueChanged<TravelEvent> onRenameEvent;
   final ValueChanged<TravelTrip> onTripChanged;
   final AttachmentPickAction onAddAttachment;
+  final AttachmentPhotoPickAction onPickPhoto;
   final ValueChanged<TravelAttachment> onOpenAttachment;
   final AttachmentAction onRemoveAttachment;
   final AttachmentMemberAction onUpdateAttachmentMembers;
@@ -1442,6 +1500,7 @@ class _TripDetailViewState extends State<TripDetailView>
               FilesTab(
                 trip: widget.trip,
                 onAddAttachment: widget.onAddAttachment,
+                onPickPhoto: widget.onPickPhoto,
                 onOpenAttachment: widget.onOpenAttachment,
                 onRemoveAttachment: widget.onRemoveAttachment,
                 onUpdateAttachmentMembers: widget.onUpdateAttachmentMembers,
@@ -2423,7 +2482,11 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                                 ),
                                 visualDensity: VisualDensity.compact,
                               ),
-                              if (event.splitCount > 1)
+                              if (event.splitCount > 1 &&
+                                  !_memberIdsIncludeEveryTripMember(
+                                    widget.trip,
+                                    event.expenseMemberIds,
+                                  ))
                                 Chip(
                                   avatar: const Icon(
                                     Icons.group_outlined,
@@ -2971,6 +3034,7 @@ class FilesTab extends StatefulWidget {
     super.key,
     required this.trip,
     required this.onAddAttachment,
+    required this.onPickPhoto,
     required this.onOpenAttachment,
     required this.onRemoveAttachment,
     required this.onUpdateAttachmentMembers,
@@ -2978,6 +3042,7 @@ class FilesTab extends StatefulWidget {
 
   final TravelTrip trip;
   final AttachmentPickAction onAddAttachment;
+  final AttachmentPhotoPickAction onPickPhoto;
   final ValueChanged<TravelAttachment> onOpenAttachment;
   final AttachmentAction onRemoveAttachment;
   final AttachmentMemberAction onUpdateAttachmentMembers;
@@ -2986,8 +3051,29 @@ class FilesTab extends StatefulWidget {
   State<FilesTab> createState() => _FilesTabState();
 }
 
-class _FilesTabState extends State<FilesTab> {
+class _FilesTabState extends State<FilesTab>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
   String? _selectedMemberId;
+
+  bool get _selectedTabIsFiles => _tabController.index == 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    _tabController.addListener(() {
+      if (mounted) {
+        setState(() {});
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
 
   Future<void> _editPinnedMembers(AttachmentListItem item) async {
     final memberIds = await showDialog<Set<String>>(
@@ -3009,83 +3095,146 @@ class _FilesTabState extends State<FilesTab> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final activeMemberId =
-        widget.trip.members.any((member) => member.id == _selectedMemberId)
-        ? _selectedMemberId
-        : null;
-    final allItems = [
+  Future<void> _addPhoto() async {
+    final source = await _showPhotoSourceSheet(context);
+    if (source == null) {
+      return;
+    }
+
+    await widget.onPickPhoto(null, source);
+  }
+
+  Future<void> _handleAdd() async {
+    if (_selectedTabIsFiles) {
+      await widget.onAddAttachment(null);
+      return;
+    }
+
+    await _addPhoto();
+  }
+
+  List<AttachmentListItem> _allItems() {
+    return [
       for (final attachment in widget.trip.attachments)
         AttachmentListItem(event: null, attachment: attachment),
       for (final event in widget.trip.sortedEvents)
         for (final attachment in event.attachments)
           AttachmentListItem(event: event, attachment: attachment),
     ];
-    final items = activeMemberId == null
-        ? allItems
-        : allItems
-              .where(
-                (item) => item.attachment.memberIds.contains(activeMemberId),
-              )
-              .toList();
+  }
 
-    if (allItems.isEmpty) {
-      return EmptyTabView(
-        icon: Icons.folder_open_outlined,
-        title: widget.trip.events.isEmpty ? 'No events yet' : 'No files yet',
-        actionLabel: widget.trip.events.isEmpty ? null : 'Add',
-        onAction: widget.trip.events.isEmpty
-            ? null
-            : () => widget.onAddAttachment(null),
+  List<AttachmentListItem> _filterItems(
+    List<AttachmentListItem> items,
+    AttachmentKind kind,
+    String? memberId,
+  ) {
+    return [
+      for (final item in items)
+        if (item.attachment.kind == kind &&
+            (memberId == null || item.attachment.memberIds.contains(memberId)))
+          item,
+    ];
+  }
+
+  List<_AttachmentEventGroup> _groupItems(List<AttachmentListItem> items) {
+    final groups = <_AttachmentEventGroup>[];
+    for (final event in widget.trip.sortedEvents) {
+      final eventItems = [
+        for (final item in items)
+          if (item.event?.id == event.id) item,
+      ];
+      if (eventItems.isNotEmpty) {
+        groups.add(_AttachmentEventGroup(event: event, items: eventItems));
+      }
+    }
+
+    final tripItems = [
+      for (final item in items)
+        if (item.event == null) item,
+    ]..sort((a, b) => a.attachment.addedAt.compareTo(b.attachment.addedAt));
+    if (tripItems.isNotEmpty) {
+      groups.add(_AttachmentEventGroup(event: null, items: tripItems));
+    }
+
+    return groups;
+  }
+
+  Widget _buildControls(String? activeMemberId) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 20, 8),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          FilledButton.icon(
+            onPressed: widget.trip.events.isEmpty ? null : _handleAdd,
+            icon: Icon(
+              _selectedTabIsFiles
+                  ? Icons.attach_file
+                  : Icons.add_photo_alternate_outlined,
+            ),
+            label: const Text('Add'),
+          ),
+          if (widget.trip.members.isNotEmpty)
+            ChoiceChip(
+              label: const Text('All'),
+              selected: activeMemberId == null,
+              onSelected: (_) => setState(() => _selectedMemberId = null),
+            ),
+          for (final member in widget.trip.members)
+            ChoiceChip(
+              avatar: const Icon(Icons.person_outline, size: 18),
+              label: Text(member.name),
+              selected: activeMemberId == member.id,
+              onSelected: (_) => setState(() => _selectedMemberId = member.id),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyState(IconData icon, String title) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 48, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(height: 12),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFilesView(List<AttachmentListItem> items, String? memberId) {
+    if (items.isEmpty) {
+      return _buildEmptyState(
+        Icons.attach_file,
+        memberId == null ? 'No files yet' : 'No files pinned to this traveler',
       );
     }
 
+    final groups = _groupItems(items);
     return AppScrollbar(
       builder: (controller) => ListView(
         controller: controller,
-        padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
+        padding: const EdgeInsets.fromLTRB(16, 12, 20, 24),
         children: [
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              FilledButton.icon(
-                onPressed: () => widget.onAddAttachment(null),
-                icon: const Icon(Icons.add),
-                label: const Text('Add'),
-              ),
-              if (widget.trip.members.isNotEmpty)
-                ChoiceChip(
-                  label: const Text('All'),
-                  selected: activeMemberId == null,
-                  onSelected: (_) => setState(() => _selectedMemberId = null),
-                ),
-              for (final member in widget.trip.members)
-                ChoiceChip(
-                  avatar: const Icon(Icons.person_outline, size: 18),
-                  label: Text(member.name),
-                  selected: activeMemberId == member.id,
-                  onSelected: (_) =>
-                      setState(() => _selectedMemberId = member.id),
-                ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          if (items.isEmpty)
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Text(
-                  activeMemberId == null
-                      ? 'No files yet'
-                      : 'No files pinned to this traveler',
-                ),
-              ),
-            )
-          else
-            for (final item in items) ...[
+          for (final group in groups) ...[
+            _AttachmentGroupHeader(
+              event: group.event,
+              count: group.items.length,
+              kindLabel: group.items.length == 1 ? 'file' : 'files',
+            ),
+            for (final item in group.items) ...[
               _AttachmentCard(
                 trip: widget.trip,
                 item: item,
@@ -3095,6 +3244,168 @@ class _FilesTabState extends State<FilesTab> {
               ),
               const SizedBox(height: 8),
             ],
+            const SizedBox(height: 8),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPhotosView(List<AttachmentListItem> items, String? memberId) {
+    if (items.isEmpty) {
+      return _buildEmptyState(
+        Icons.photo_library_outlined,
+        memberId == null
+            ? 'No photos yet'
+            : 'No photos pinned to this traveler',
+      );
+    }
+
+    final groups = _groupItems(items);
+    return AppScrollbar(
+      builder: (controller) => ListView(
+        controller: controller,
+        padding: const EdgeInsets.fromLTRB(16, 12, 20, 24),
+        children: [
+          for (final group in groups) ...[
+            _AttachmentGroupHeader(
+              event: group.event,
+              count: group.items.length,
+              kindLabel: group.items.length == 1 ? 'photo' : 'photos',
+            ),
+            GridView.builder(
+              shrinkWrap: true,
+              primary: false,
+              physics: const NeverScrollableScrollPhysics(),
+              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                maxCrossAxisExtent: 220,
+                mainAxisSpacing: 12,
+                crossAxisSpacing: 12,
+                childAspectRatio: 0.78,
+              ),
+              itemCount: group.items.length,
+              itemBuilder: (context, index) {
+                final item = group.items[index];
+                final attachment = item.attachment;
+                return PhotoAttachmentCard(
+                  trip: widget.trip,
+                  attachment: attachment,
+                  onOpen: () => widget.onOpenAttachment(attachment),
+                  onEditPinnedMembers: () => _editPinnedMembers(item),
+                  onRemove: () =>
+                      widget.onRemoveAttachment(item.event, attachment),
+                );
+              },
+            ),
+            const SizedBox(height: 16),
+          ],
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final activeMemberId =
+        widget.trip.members.any((member) => member.id == _selectedMemberId)
+        ? _selectedMemberId
+        : null;
+    final allItems = _allItems();
+
+    if (widget.trip.events.isEmpty && allItems.isEmpty) {
+      return const EmptyTabView(
+        icon: Icons.folder_open_outlined,
+        title: 'No events yet',
+      );
+    }
+
+    final files = _filterItems(allItems, AttachmentKind.file, activeMemberId);
+    final photos = _filterItems(allItems, AttachmentKind.photo, activeMemberId);
+
+    return Column(
+      children: [
+        _buildControls(activeMemberId),
+        TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(icon: Icon(Icons.attach_file), text: 'Files'),
+            Tab(icon: Icon(Icons.photo_library_outlined), text: 'Photos'),
+          ],
+        ),
+        Expanded(
+          child: TabBarView(
+            controller: _tabController,
+            children: [
+              _buildFilesView(files, activeMemberId),
+              _buildPhotosView(photos, activeMemberId),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _AttachmentGroupHeader extends StatelessWidget {
+  const _AttachmentGroupHeader({
+    required this.event,
+    required this.count,
+    required this.kindLabel,
+  });
+
+  final TravelEvent? event;
+  final int count;
+  final String kindLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    final event = this.event;
+    final colors = Theme.of(context).colorScheme;
+    final title = event?.title ?? 'Trip attachments';
+    final subtitle = event == null
+        ? 'No event'
+        : '${_dayFormatter.format(event.startAt)} - ${event.timeRangeLabel}';
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(2, 10, 2, 8),
+      child: Row(
+        children: [
+          Icon(
+            event == null ? Icons.folder_open_outlined : Icons.event_outlined,
+            size: 18,
+            color: colors.primary,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                Text(
+                  subtitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: colors.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '$count $kindLabel',
+            style: Theme.of(
+              context,
+            ).textTheme.labelMedium?.copyWith(color: colors.onSurfaceVariant),
+          ),
         ],
       ),
     );
@@ -3232,54 +3543,47 @@ class PhotoAttachmentCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       clipBehavior: Clip.antiAlias,
-      child: Stack(
+      child: Column(
         children: [
-          Positioned.fill(
-            child: InkWell(
-              onTap: onOpen,
-              child: AttachmentThumbnail(
-                attachment: attachment,
-                size: double.infinity,
-                borderRadius: BorderRadius.zero,
-              ),
-            ),
-          ),
-          Positioned(
-            right: 6,
-            top: 6,
-            child: Material(
-              color: Theme.of(
-                context,
-              ).colorScheme.surface.withValues(alpha: 0.92),
-              shape: const CircleBorder(),
-              child: IconButton(
-                tooltip: 'Remove',
-                visualDensity: VisualDensity.compact,
-                onPressed: onRemove,
-                icon: const Icon(Icons.close, size: 18),
-              ),
-            ),
-          ),
-          Positioned(
-            left: 8,
-            right: 8,
-            bottom: 8,
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: Theme.of(
-                  context,
-                ).colorScheme.surface.withValues(alpha: 0.92),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(8, 2, 8, 6),
-                child: MemberTagWrap(
-                  trip: trip,
-                  memberIds: attachment.memberIds,
-                  onAdd: onEditPinnedMembers,
-                  compact: true,
+          Expanded(
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: InkWell(
+                    onTap: onOpen,
+                    child: AttachmentThumbnail(
+                      attachment: attachment,
+                      size: double.infinity,
+                      borderRadius: BorderRadius.zero,
+                    ),
+                  ),
                 ),
-              ),
+                Positioned(
+                  right: 6,
+                  top: 6,
+                  child: Material(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.surface.withValues(alpha: 0.92),
+                    shape: const CircleBorder(),
+                    child: IconButton(
+                      tooltip: 'Remove',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: onRemove,
+                      icon: const Icon(Icons.close, size: 18),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+            child: MemberTagWrap(
+              trip: trip,
+              memberIds: attachment.memberIds,
+              onAdd: onEditPinnedMembers,
+              compact: true,
             ),
           ),
         ],
@@ -3332,6 +3636,13 @@ class AttachmentListItem {
 
   final TravelEvent? event;
   final TravelAttachment attachment;
+}
+
+class _AttachmentEventGroup {
+  const _AttachmentEventGroup({required this.event, required this.items});
+
+  final TravelEvent? event;
+  final List<AttachmentListItem> items;
 }
 
 class AttachmentTargetDialog extends StatelessWidget {
@@ -3462,6 +3773,43 @@ class MemberTagWrap extends StatelessWidget {
   final VoidCallback? onAdd;
   final bool compact;
 
+  List<Widget> _withHorizontalSpacing(List<Widget> children) {
+    final spaced = <Widget>[];
+    for (final child in children) {
+      if (spaced.isNotEmpty) {
+        spaced.add(const SizedBox(width: 6));
+      }
+      spaced.add(child);
+    }
+    return spaced;
+  }
+
+  Widget _buildAddChip(BuildContext context) {
+    return ActionChip(
+      tooltip: 'Pin travelers',
+      label: const Text('+'),
+      labelStyle: Theme.of(
+        context,
+      ).textTheme.labelMedium?.copyWith(fontWeight: FontWeight.w800),
+      labelPadding: const EdgeInsets.symmetric(horizontal: 6),
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      onPressed: onAdd,
+    );
+  }
+
+  Widget _buildMemberChip(String label) {
+    return Chip(
+      avatar: Icon(
+        label == 'All' ? Icons.groups_outlined : Icons.person_outline,
+        size: 16,
+      ),
+      label: Text(label),
+      visualDensity: VisualDensity.compact,
+      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final labels = _memberTagLabelsForIds(trip, memberIds);
@@ -3469,31 +3817,22 @@ class MemberTagWrap extends StatelessWidget {
       return const SizedBox.shrink();
     }
 
+    final chips = [
+      if (onAdd != null) _buildAddChip(context),
+      for (final label in labels) _buildMemberChip(label),
+    ];
+
     return Padding(
-      padding: const EdgeInsets.only(top: 6),
-      child: Wrap(
-        spacing: 6,
-        runSpacing: 4,
-        children: [
-          if (onAdd != null)
-            ActionChip(
-              avatar: const Icon(Icons.add, size: 16),
-              label: Text(compact ? 'Tag' : 'Add tag'),
-              visualDensity: VisualDensity.compact,
-              onPressed: onAdd,
-            ),
-          for (final label in labels)
-            Chip(
-              avatar: Icon(
-                label == 'All' ? Icons.groups_outlined : Icons.person_outline,
-                size: 16,
+      padding: EdgeInsets.only(top: compact ? 0 : 6),
+      child: compact
+          ? SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: _withHorizontalSpacing(chips),
               ),
-              label: Text(label),
-              visualDensity: VisualDensity.compact,
-              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-        ],
-      ),
+            )
+          : Wrap(spacing: 6, runSpacing: 4, children: chips),
     );
   }
 }
@@ -3601,31 +3940,7 @@ class _EventFilesDialogState extends State<EventFilesDialog>
   }
 
   Future<void> _addPhoto() async {
-    final source = await showModalBottomSheet<ImageSource>(
-      context: context,
-      showDragHandle: true,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              ListTile(
-                leading: const Icon(Icons.photo_library_outlined),
-                title: const Text('Gallery'),
-                onTap: () => Navigator.of(context).pop(ImageSource.gallery),
-              ),
-              ListTile(
-                leading: const Icon(Icons.photo_camera_outlined),
-                title: const Text('Camera'),
-                onTap: () => Navigator.of(context).pop(ImageSource.camera),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-
+    final source = await _showPhotoSourceSheet(context);
     if (source == null) {
       return;
     }
