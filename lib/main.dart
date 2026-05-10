@@ -4,9 +4,11 @@ import 'dart:math';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:gal/gal.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -43,7 +45,10 @@ const _supportedCurrencies = [
 ];
 
 typedef AttachmentAction =
-    void Function(TravelEvent? event, TravelAttachment attachment);
+    Future<void> Function(TravelEvent? event, TravelAttachment attachment);
+
+typedef AttachmentPickAction =
+    Future<TravelAttachment?> Function(TravelEvent? event);
 
 typedef AttachmentMemberAction =
     Future<void> Function(
@@ -148,6 +153,19 @@ String _attachmentKindName(AttachmentKind kind) {
   };
 }
 
+Uint8List? _attachmentBytes(TravelAttachment attachment) {
+  final bytesBase64 = attachment.bytesBase64;
+  if (bytesBase64 == null || bytesBase64.isEmpty) {
+    return null;
+  }
+
+  try {
+    return base64Decode(bytesBase64);
+  } on Object {
+    return null;
+  }
+}
+
 String _formatMoney(String code, double amount) {
   return '${_currencyForCode(code).code} ${_moneyFormatter.format(amount)}';
 }
@@ -213,23 +231,16 @@ String _shareDivider([int length = 42]) {
   return '-' * length;
 }
 
-String _shareTitleLine(String title) {
-  return '------------- $title ---------------';
-}
-
 String _buildTripShareText(TravelTrip trip) {
+  final members = trip.members.isEmpty
+      ? 'No members'
+      : trip.members.map((member) => member.name).join(', ');
   final buffer = StringBuffer()
-    ..writeln(_shareTitleLine(trip.name))
-    ..writeln(
-      [
-        trip.country.isEmpty ? 'No location' : trip.country,
-        trip.dateRangeLabel,
-        trip.members.isEmpty
-            ? 'No members'
-            : trip.members.map((member) => member.name).join(', '),
-      ].join(', '),
-    )
-    ..writeln(_shareDivider());
+    ..writeln(_shareDivider(48))
+    ..writeln(trip.name.toUpperCase())
+    ..writeln('Dates: ${trip.dateRangeLabel}')
+    ..writeln('Members: $members')
+    ..writeln(_shareDivider(48));
 
   DateTime? currentDay;
   for (final event in trip.sortedEvents) {
@@ -240,19 +251,16 @@ String _buildTripShareText(TravelTrip trip) {
     );
     if (currentDay == null || !DateUtils.isSameDay(currentDay, eventDay)) {
       if (currentDay != null) {
-        buffer.writeln(_shareDivider());
+        buffer.writeln();
       }
-      buffer.writeln(
-        '-------------- ${_dayFormatter.format(eventDay)} ------------------',
-      );
+      buffer
+        ..writeln()
+        ..writeln(_dayFormatter.format(eventDay))
+        ..writeln(_shareDivider(30));
       currentDay = eventDay;
     }
 
-    buffer
-      ..writeln('${event.timeRangeLabel} - ${event.title}')
-      ..writeln(
-        'Location: ${event.location.isEmpty ? 'No location' : event.location}',
-      );
+    buffer.writeln('${event.timeRangeLabel}  |  ${event.title}');
     if (event.planNotes.isNotEmpty) {
       buffer.writeln('Plan: ${event.planNotes}');
     }
@@ -264,12 +272,16 @@ String _buildTripShareText(TravelTrip trip) {
     }
     if (event.expenseAmount > 0) {
       final members = _memberTagLabelsForIds(trip, event.expenseMemberIds);
+      final perPerson = event.splitCount <= 1
+          ? event.expenseAmount
+          : event.expenseAmount / event.splitCount;
       buffer.writeln(
         [
           'Expense: ${_formatMoney(event.expenseCurrencyCode, event.expenseAmount)}',
-          if (event.splitCount > 1) 'split ${event.splitCount} ways',
-          if (members.isNotEmpty) 'with ${members.join(', ')}',
-        ].join(' - '),
+          if (event.splitCount > 1)
+            '${_formatMoney(event.expenseCurrencyCode, perPerson)} each',
+          if (members.isNotEmpty) members.join(', '),
+        ].join(' | '),
       );
     }
     buffer.writeln();
@@ -279,7 +291,7 @@ String _buildTripShareText(TravelTrip trip) {
     buffer.writeln('No plan yet.');
   }
 
-  buffer.writeln(_shareDivider(41));
+  buffer.writeln(_shareDivider(48));
   return buffer.toString().trimRight();
 }
 
@@ -388,6 +400,18 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
 
     setState(() => _selectedTripId = trip.id);
     await _persistTrips(next);
+  }
+
+  Future<void> _updateCurrentTrip(
+    TravelTrip trip,
+    TravelTrip Function(TravelTrip currentTrip) update,
+  ) async {
+    final index = _trips.indexWhere((candidate) => candidate.id == trip.id);
+    if (index == -1) {
+      return;
+    }
+
+    await _upsertTrip(update(_trips[index]));
   }
 
   Future<void> _deleteTrip(TravelTrip trip) async {
@@ -500,6 +524,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
   Future<void> _showEventActions(TravelTrip trip, TravelEvent event) async {
     final action = await showModalBottomSheet<EventAction>(
       context: context,
+      isScrollControlled: true,
       showDragHandle: true,
       builder: (context) => EventActionsSheet(event: event),
     );
@@ -637,14 +662,14 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     );
   }
 
-  Future<void> _addAttachmentToEvent(
+  Future<TravelAttachment> _addAttachmentToEvent(
     TravelTrip trip,
     TravelEvent event,
     TravelAttachment attachment,
   ) async {
-    await _upsertTrip(
-      trip.copyWith(
-        events: trip.events.map((candidate) {
+    await _updateCurrentTrip(trip, (currentTrip) {
+      return currentTrip.copyWith(
+        events: currentTrip.events.map((candidate) {
           if (candidate.id != event.id) {
             return candidate;
           }
@@ -653,16 +678,21 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
             attachments: [...candidate.attachments, attachment],
           );
         }).toList(),
-      ),
-    );
+      );
+    });
+
+    return attachment;
   }
 
-  Future<void> _pickAttachment(TravelTrip trip, {TravelEvent? event}) async {
+  Future<TravelAttachment?> _pickAttachment(
+    TravelTrip trip, {
+    TravelEvent? event,
+  }) async {
     var targetEvent = event;
     if (targetEvent == null) {
       if (trip.events.isEmpty) {
         _showSnack('Create an event before attaching files.');
-        return;
+        return null;
       }
 
       targetEvent = await showDialog<TravelEvent>(
@@ -671,7 +701,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
       );
 
       if (targetEvent == null || !mounted) {
-        return;
+        return null;
       }
     }
 
@@ -682,7 +712,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     );
 
     if (result == null || result.files.isEmpty) {
-      return;
+      return null;
     }
 
     final file = result.files.single;
@@ -698,10 +728,10 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
       memberIds: const [],
     );
 
-    await _addAttachmentToEvent(trip, targetEvent, attachment);
+    return _addAttachmentToEvent(trip, targetEvent, attachment);
   }
 
-  Future<void> _pickPhoto(
+  Future<TravelAttachment?> _pickPhoto(
     TravelTrip trip,
     TravelEvent event,
     ImageSource source,
@@ -713,10 +743,20 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
       );
 
       if (photo == null) {
-        return;
+        return null;
       }
 
       final bytes = await photo.readAsBytes();
+      if (!kIsWeb && source == ImageSource.camera) {
+        try {
+          await Gal.putImage(photo.path, album: 'Traveler');
+        } on Object {
+          if (mounted) {
+            _showSnack('Photo attached, but could not save to gallery.');
+          }
+        }
+      }
+
       final attachment = TravelAttachment(
         id: _newId('photo'),
         name: photo.name,
@@ -729,12 +769,13 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
         memberIds: const [],
       );
 
-      await _addAttachmentToEvent(trip, event, attachment);
+      return _addAttachmentToEvent(trip, event, attachment);
     } on Object {
       if (!mounted) {
-        return;
+        return null;
       }
       _showSnack('Could not add a photo on this device.');
+      return null;
     }
   }
 
@@ -744,9 +785,9 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     TravelEvent? event,
   ) async {
     if (event != null) {
-      await _upsertTrip(
-        trip.copyWith(
-          events: trip.events.map((candidate) {
+      await _updateCurrentTrip(trip, (currentTrip) {
+        return currentTrip.copyWith(
+          events: currentTrip.events.map((candidate) {
             if (candidate.id != event.id) {
               return candidate;
             }
@@ -757,14 +798,15 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                   .toList(),
             );
           }).toList(),
-        ),
-      );
+        );
+      });
       return;
     }
 
-    await _upsertTrip(
-      trip.copyWith(
-        attachments: trip.attachments
+    await _updateCurrentTrip(
+      trip,
+      (currentTrip) => currentTrip.copyWith(
+        attachments: currentTrip.attachments
             .where((candidate) => candidate.id != attachment.id)
             .toList(),
       ),
@@ -793,9 +835,9 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     }
 
     if (event != null) {
-      await _upsertTrip(
-        trip.copyWith(
-          events: trip.events.map((candidate) {
+      await _updateCurrentTrip(trip, (currentTrip) {
+        return currentTrip.copyWith(
+          events: currentTrip.events.map((candidate) {
             if (candidate.id != event.id) {
               return candidate;
             }
@@ -804,14 +846,58 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
               attachments: updateAttachments(candidate.attachments),
             );
           }).toList(),
-        ),
-      );
+        );
+      });
       return;
     }
 
-    await _upsertTrip(
-      trip.copyWith(attachments: updateAttachments(trip.attachments)),
+    await _updateCurrentTrip(
+      trip,
+      (currentTrip) => currentTrip.copyWith(
+        attachments: updateAttachments(currentTrip.attachments),
+      ),
     );
+  }
+
+  Future<void> _shareAttachment(TravelAttachment attachment) async {
+    try {
+      final bytes = _attachmentBytes(attachment);
+      final path = attachment.path;
+      if (bytes == null && (path == null || path.isEmpty)) {
+        _showSnack('This attachment is not available to share.');
+        return;
+      }
+
+      final file = bytes != null
+          ? XFile.fromData(
+              bytes,
+              mimeType: attachment.mimeType,
+              name: attachment.name,
+              length: attachment.sizeBytes,
+            )
+          : XFile(
+              path!,
+              mimeType: attachment.mimeType,
+              name: attachment.name,
+              length: attachment.sizeBytes,
+            );
+
+      await SharePlus.instance.share(
+        ShareParams(
+          title: attachment.name,
+          subject: attachment.name,
+          files: [file],
+          fileNameOverrides: [attachment.name],
+          downloadFallbackEnabled: true,
+        ),
+      );
+    } on Object {
+      if (!mounted) {
+        return;
+      }
+
+      _showSnack('Could not share ${attachment.name}.');
+    }
   }
 
   Future<void> _openAttachment(TravelAttachment attachment) async {
@@ -819,7 +905,10 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     if (bytesBase64 != null && bytesBase64.isNotEmpty) {
       await showDialog<void>(
         context: context,
-        builder: (context) => AttachmentPreviewDialog(attachment: attachment),
+        builder: (context) => AttachmentPreviewDialog(
+          attachment: attachment,
+          onShare: () => _shareAttachment(attachment),
+        ),
       );
       return;
     }
@@ -879,15 +968,22 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Traveler'),
+        title: GestureDetector(
+          onTap: selectedTrip == null
+              ? null
+              : () => setState(() => _selectedTripId = null),
+          child: const Text('Traveler'),
+        ),
         centerTitle: true,
-        actions: [
-          IconButton(
-            tooltip: 'New trip',
-            onPressed: () => _showTripDialog(),
-            icon: const Icon(Icons.add),
-          ),
-        ],
+        actions: selectedTrip == null || isWide
+            ? [
+                IconButton(
+                  tooltip: 'New trip',
+                  onPressed: () => _showTripDialog(),
+                  icon: const Icon(Icons.add),
+                ),
+              ]
+            : null,
       ),
       body: SafeArea(
         child: _trips.isEmpty
@@ -930,17 +1026,15 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                             onRenameEvent: (event) =>
                                 _showEventTitleDialog(selectedTrip, event),
                             onTripChanged: _upsertTrip,
-                            onAddAttachment: (event) {
-                              _pickAttachment(selectedTrip, event: event);
-                            },
+                            onAddAttachment: (event) =>
+                                _pickAttachment(selectedTrip, event: event),
                             onOpenAttachment: _openAttachment,
-                            onRemoveAttachment: (event, attachment) {
-                              _removeAttachment(
-                                selectedTrip,
-                                attachment,
-                                event,
-                              );
-                            },
+                            onRemoveAttachment: (event, attachment) =>
+                                _removeAttachment(
+                                  selectedTrip,
+                                  attachment,
+                                  event,
+                                ),
                             onUpdateAttachmentMembers:
                                 (event, attachment, memberIds) =>
                                     _updateAttachmentMembers(
@@ -965,8 +1059,6 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
               )
             : TripDetailView(
                 trip: selectedTrip,
-                compact: true,
-                onBack: () => setState(() => _selectedTripId = null),
                 onEditTrip: () => _showTripDialog(trip: selectedTrip),
                 onManageMembers: () => _showMembersDialog(selectedTrip),
                 onDeleteTrip: () => _deleteTrip(selectedTrip),
@@ -983,9 +1075,8 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                 onAddAttachment: (event) =>
                     _pickAttachment(selectedTrip, event: event),
                 onOpenAttachment: _openAttachment,
-                onRemoveAttachment: (event, attachment) {
-                  _removeAttachment(selectedTrip, attachment, event);
-                },
+                onRemoveAttachment: (event, attachment) =>
+                    _removeAttachment(selectedTrip, attachment, event),
                 onUpdateAttachmentMembers: (event, attachment, memberIds) =>
                     _updateAttachmentMembers(
                       selectedTrip,
@@ -1182,7 +1273,7 @@ class TripListPane extends StatelessWidget {
   }
 }
 
-class TripDetailView extends StatelessWidget {
+class TripDetailView extends StatefulWidget {
   const TripDetailView({
     super.key,
     required this.trip,
@@ -1200,13 +1291,9 @@ class TripDetailView extends StatelessWidget {
     required this.onOpenAttachment,
     required this.onRemoveAttachment,
     required this.onUpdateAttachmentMembers,
-    this.compact = false,
-    this.onBack,
   });
 
   final TravelTrip trip;
-  final bool compact;
-  final VoidCallback? onBack;
   final VoidCallback onEditTrip;
   final VoidCallback onManageMembers;
   final VoidCallback onDeleteTrip;
@@ -1217,60 +1304,123 @@ class TripDetailView extends StatelessWidget {
   final ValueChanged<TravelEvent> onDeleteEvent;
   final ValueChanged<TravelEvent> onRenameEvent;
   final ValueChanged<TravelTrip> onTripChanged;
-  final ValueChanged<TravelEvent?> onAddAttachment;
+  final AttachmentPickAction onAddAttachment;
   final ValueChanged<TravelAttachment> onOpenAttachment;
   final AttachmentAction onRemoveAttachment;
   final AttachmentMemberAction onUpdateAttachmentMembers;
 
   @override
+  State<TripDetailView> createState() => _TripDetailViewState();
+}
+
+class _TripDetailViewState extends State<TripDetailView>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+  var _headerExpanded = true;
+  var _lastTabIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 4, vsync: this);
+    _tabController.addListener(_handleTabChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant TripDetailView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.trip.id != widget.trip.id) {
+      _headerExpanded = true;
+      _tabController.index = 0;
+      _lastTabIndex = 0;
+    }
+  }
+
+  @override
+  void dispose() {
+    _tabController.removeListener(_handleTabChanged);
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  void _handleTabChanged() {
+    if (_tabController.index == _lastTabIndex) {
+      return;
+    }
+
+    _lastTabIndex = _tabController.index;
+    _collapseHeader();
+  }
+
+  void _collapseHeader() {
+    if (_headerExpanded) {
+      setState(() => _headerExpanded = false);
+    }
+  }
+
+  void _handleHeaderTap() {
+    if (_headerExpanded) {
+      widget.onEditTrip();
+      return;
+    }
+
+    setState(() => _headerExpanded = true);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return DefaultTabController(
-      length: 4,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          TripHeader(
-            trip: trip,
-            compact: compact,
-            onBack: onBack,
-            onEdit: onEditTrip,
-            onManageMembers: onManageMembers,
-            onDelete: onDeleteTrip,
-            onShare: onShareTrip,
-          ),
-          const TabBar(
-            tabs: [
-              Tab(icon: Icon(Icons.edit_note_outlined), text: 'Journal'),
-              Tab(icon: Icon(Icons.route_outlined), text: 'Plan'),
-              Tab(icon: Icon(Icons.currency_exchange), text: 'Currency'),
-              Tab(icon: Icon(Icons.folder_open_outlined), text: 'Files'),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        TripHeader(
+          trip: widget.trip,
+          expanded: _headerExpanded,
+          onTitleTap: _handleHeaderTap,
+          onManageMembers: widget.onManageMembers,
+          onDelete: widget.onDeleteTrip,
+          onShare: widget.onShareTrip,
+        ),
+        TabBar(
+          controller: _tabController,
+          onTap: (_) => _collapseHeader(),
+          tabs: const [
+            Tab(icon: Icon(Icons.edit_note_outlined), text: 'Journal'),
+            Tab(icon: Icon(Icons.route_outlined), text: 'Plan'),
+            Tab(icon: Icon(Icons.currency_exchange), text: 'Currency'),
+            Tab(icon: Icon(Icons.folder_open_outlined), text: 'Files'),
+          ],
+        ),
+        Expanded(
+          child: TabBarView(
+            controller: _tabController,
+            children: [
+              JournalTab(
+                trip: widget.trip,
+                onOpenEventActions: widget.onOpenEventActions,
+              ),
+              PlanTab(
+                trip: widget.trip,
+                onAddEvent: widget.onAddEvent,
+                onEditEvent: widget.onEditEvent,
+                onOpenEventActions: widget.onOpenEventActions,
+                onDeleteEvent: widget.onDeleteEvent,
+                onRenameEvent: widget.onRenameEvent,
+              ),
+              CurrencyTab(
+                trip: widget.trip,
+                onTripChanged: widget.onTripChanged,
+              ),
+              FilesTab(
+                trip: widget.trip,
+                onAddAttachment: widget.onAddAttachment,
+                onOpenAttachment: widget.onOpenAttachment,
+                onRemoveAttachment: widget.onRemoveAttachment,
+                onUpdateAttachmentMembers: widget.onUpdateAttachmentMembers,
+              ),
             ],
           ),
-          Expanded(
-            child: TabBarView(
-              children: [
-                JournalTab(trip: trip, onOpenEventActions: onOpenEventActions),
-                PlanTab(
-                  trip: trip,
-                  onAddEvent: onAddEvent,
-                  onEditEvent: onEditEvent,
-                  onOpenEventActions: onOpenEventActions,
-                  onDeleteEvent: onDeleteEvent,
-                  onRenameEvent: onRenameEvent,
-                ),
-                CurrencyTab(trip: trip, onTripChanged: onTripChanged),
-                FilesTab(
-                  trip: trip,
-                  onAddAttachment: onAddAttachment,
-                  onOpenAttachment: onOpenAttachment,
-                  onRemoveAttachment: onRemoveAttachment,
-                  onUpdateAttachmentMembers: onUpdateAttachmentMembers,
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 }
@@ -1279,21 +1429,19 @@ class TripHeader extends StatelessWidget {
   const TripHeader({
     super.key,
     required this.trip,
-    required this.compact,
-    required this.onEdit,
+    required this.expanded,
+    required this.onTitleTap,
     required this.onManageMembers,
     required this.onDelete,
     required this.onShare,
-    this.onBack,
   });
 
   final TravelTrip trip;
-  final bool compact;
-  final VoidCallback onEdit;
+  final bool expanded;
+  final VoidCallback onTitleTap;
   final VoidCallback onManageMembers;
   final VoidCallback onDelete;
   final VoidCallback onShare;
-  final VoidCallback? onBack;
 
   @override
   Widget build(BuildContext context) {
@@ -1306,17 +1454,10 @@ class TripHeader extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          if (compact)
-            IconButton(
-              tooltip: 'Trips',
-              onPressed: onBack,
-              icon: const Icon(Icons.arrow_back),
-            )
-          else
-            const SizedBox(width: 8),
+          const SizedBox(width: 8),
           Expanded(
             child: InkWell(
-              onTap: onEdit,
+              onTap: onTitleTap,
               borderRadius: BorderRadius.circular(8),
               child: Padding(
                 padding: const EdgeInsets.all(8),
@@ -1331,27 +1472,29 @@ class TripHeader extends StatelessWidget {
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    const SizedBox(height: 6),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 6,
-                      children: [
-                        TripMetaChip(
-                          icon: Icons.place_outlined,
-                          label: trip.country.isEmpty
-                              ? 'No country'
-                              : trip.country,
-                        ),
-                        TripMetaChip(
-                          icon: Icons.calendar_today_outlined,
-                          label: range,
-                        ),
-                        TripMetaChip(
-                          icon: Icons.group_outlined,
-                          label: '${trip.members.length} members',
-                        ),
-                      ],
-                    ),
+                    if (expanded) ...[
+                      const SizedBox(height: 6),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 6,
+                        children: [
+                          TripMetaChip(
+                            icon: Icons.place_outlined,
+                            label: trip.country.isEmpty
+                                ? 'No country'
+                                : trip.country,
+                          ),
+                          TripMetaChip(
+                            icon: Icons.calendar_today_outlined,
+                            label: range,
+                          ),
+                          TripMetaChip(
+                            icon: Icons.group_outlined,
+                            label: '${trip.members.length} members',
+                          ),
+                        ],
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -1735,52 +1878,61 @@ class EventActionsSheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final maxHeight = MediaQuery.sizeOf(context).height * 0.75;
+
     return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              event.title,
-              style: Theme.of(context).textTheme.titleLarge,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxHeight),
+        child: AppScrollbar(
+          builder: (controller) => SingleChildScrollView(
+            controller: controller,
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  event.title,
+                  style: Theme.of(context).textTheme.titleLarge,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 12),
+                ActionTile(
+                  icon: Icons.route_outlined,
+                  title: 'Plan details',
+                  subtitle: 'Time, duration, and notes',
+                  onTap: () => Navigator.of(context).pop(EventAction.plan),
+                ),
+                ActionTile(
+                  icon: Icons.edit_note_outlined,
+                  title: 'Experience',
+                  subtitle: 'Journal notes and feeling',
+                  onTap: () =>
+                      Navigator.of(context).pop(EventAction.experience),
+                ),
+                ActionTile(
+                  icon: Icons.receipt_long_outlined,
+                  title: 'Expense',
+                  subtitle: 'Amount, currency, and split count',
+                  onTap: () => Navigator.of(context).pop(EventAction.expense),
+                ),
+                ActionTile(
+                  icon: Icons.folder_open_outlined,
+                  title: 'Files and photos',
+                  subtitle: 'View, add, or remove event files',
+                  onTap: () => Navigator.of(context).pop(EventAction.files),
+                ),
+                const Divider(),
+                ActionTile(
+                  icon: Icons.delete_outline,
+                  title: 'Delete event',
+                  subtitle: 'Remove this item from the trip',
+                  onTap: () => Navigator.of(context).pop(EventAction.delete),
+                ),
+              ],
             ),
-            const SizedBox(height: 12),
-            ActionTile(
-              icon: Icons.route_outlined,
-              title: 'Plan details',
-              subtitle: 'Time, location, duration, and notes',
-              onTap: () => Navigator.of(context).pop(EventAction.plan),
-            ),
-            ActionTile(
-              icon: Icons.edit_note_outlined,
-              title: 'Experience',
-              subtitle: 'Journal notes and feeling',
-              onTap: () => Navigator.of(context).pop(EventAction.experience),
-            ),
-            ActionTile(
-              icon: Icons.receipt_long_outlined,
-              title: 'Expense',
-              subtitle: 'Amount, currency, and split count',
-              onTap: () => Navigator.of(context).pop(EventAction.expense),
-            ),
-            ActionTile(
-              icon: Icons.folder_open_outlined,
-              title: 'Files and photos',
-              subtitle: 'View, add, or remove event files',
-              onTap: () => Navigator.of(context).pop(EventAction.files),
-            ),
-            const Divider(),
-            ActionTile(
-              icon: Icons.delete_outline,
-              title: 'Delete event',
-              subtitle: 'Remove this item from the trip',
-              onTap: () => Navigator.of(context).pop(EventAction.delete),
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -1806,8 +1958,8 @@ class ActionTile extends StatelessWidget {
     return ListTile(
       contentPadding: EdgeInsets.zero,
       leading: Icon(icon),
-      title: Text(title),
-      subtitle: Text(subtitle),
+      title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: Text(subtitle, maxLines: 2, overflow: TextOverflow.ellipsis),
       trailing: const Icon(Icons.chevron_right),
       onTap: onTap,
     );
@@ -1835,20 +1987,25 @@ class JournalTab extends StatelessWidget {
       );
     }
 
-    return AppScrollbar(
-      builder: (controller) => ListView(
-        controller: controller,
-        padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
-        children: [
-          ExpenseSummaryCard(trip: trip),
-          const SizedBox(height: 12),
-          for (final event in events)
-            JournalEventCard(
-              trip: trip,
-              event: event,
-              onTap: () => onOpenEventActions(event),
-            ),
-        ],
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => FocusScope.of(context).unfocus(),
+      child: AppScrollbar(
+        builder: (controller) => ListView(
+          controller: controller,
+          keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+          padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
+          children: [
+            ExpenseSummaryCard(trip: trip),
+            const SizedBox(height: 12),
+            for (final event in events)
+              JournalEventCard(
+                trip: trip,
+                event: event,
+                onTap: () => onOpenEventActions(event),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -2249,160 +2406,167 @@ class _CurrencyTabState extends State<CurrencyTab> {
     final fromCode = _fromTarget ? _selectedCurrency : 'MYR';
     final toCode = _fromTarget ? 'MYR' : _selectedCurrency;
 
-    return AppScrollbar(
-      builder: (controller) => ListView(
-        controller: controller,
-        padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
-        children: [
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Text(
-                    'Converter',
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                  const SizedBox(height: 16),
-                  DropdownButtonFormField<String>(
-                    key: ValueKey('converter_$_selectedCurrency'),
-                    initialValue: _selectedCurrency,
-                    decoration: const InputDecoration(
-                      labelText: 'Trip currency',
-                      prefixIcon: Icon(Icons.payments_outlined),
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => FocusScope.of(context).unfocus(),
+      child: AppScrollbar(
+        builder: (controller) => ListView(
+          controller: controller,
+          keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+          padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
+          children: [
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      'Converter',
+                      style: Theme.of(context).textTheme.titleLarge,
                     ),
-                    items: [
-                      for (final currency in _supportedCurrencies)
-                        DropdownMenuItem(
-                          value: currency.code,
-                          child: Text(currency.label),
+                    const SizedBox(height: 16),
+                    DropdownButtonFormField<String>(
+                      key: ValueKey('converter_$_selectedCurrency'),
+                      initialValue: _selectedCurrency,
+                      decoration: const InputDecoration(
+                        labelText: 'Trip currency',
+                        prefixIcon: Icon(Icons.payments_outlined),
+                      ),
+                      items: [
+                        for (final currency in _supportedCurrencies)
+                          DropdownMenuItem(
+                            value: currency.code,
+                            child: Text(currency.label),
+                          ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          _selectCurrency(value);
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    SegmentedButton<bool>(
+                      segments: [
+                        ButtonSegment(
+                          value: true,
+                          icon: const Icon(Icons.arrow_forward),
+                          label: Text('$_selectedCurrency to MYR'),
                         ),
-                    ],
-                    onChanged: (value) {
-                      if (value != null) {
-                        _selectCurrency(value);
-                      }
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  SegmentedButton<bool>(
-                    segments: [
-                      ButtonSegment(
-                        value: true,
-                        icon: const Icon(Icons.arrow_forward),
-                        label: Text('$_selectedCurrency to MYR'),
+                        ButtonSegment(
+                          value: false,
+                          icon: const Icon(Icons.arrow_back),
+                          label: Text('MYR to $_selectedCurrency'),
+                        ),
+                      ],
+                      selected: {_fromTarget},
+                      onSelectionChanged: (value) {
+                        setState(() => _fromTarget = value.first);
+                      },
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _amountController,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
                       ),
-                      ButtonSegment(
-                        value: false,
-                        icon: const Icon(Icons.arrow_back),
-                        label: Text('MYR to $_selectedCurrency'),
+                      decoration: InputDecoration(
+                        labelText: 'Amount in $fromCode',
+                        prefixIcon: const Icon(Icons.calculate_outlined),
                       ),
-                    ],
-                    selected: {_fromTarget},
-                    onSelectionChanged: (value) {
-                      setState(() => _fromTarget = value.first);
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  TextField(
-                    controller: _amountController,
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
+                      onTapOutside: (_) => FocusScope.of(context).unfocus(),
+                      onChanged: (_) => setState(() {}),
                     ),
-                    decoration: InputDecoration(
-                      labelText: 'Amount in $fromCode',
-                      prefixIcon: const Icon(Icons.calculate_outlined),
-                    ),
-                    onChanged: (_) => setState(() {}),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _rateController,
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
-                    ),
-                    decoration: InputDecoration(
-                      labelText: '1 $_selectedCurrency in MYR',
-                      prefixIcon: _loadingRate
-                          ? const Padding(
-                              padding: EdgeInsets.all(12),
-                              child: SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _rateController,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: InputDecoration(
+                        labelText: '1 $_selectedCurrency in MYR',
+                        prefixIcon: _loadingRate
+                            ? const Padding(
+                                padding: EdgeInsets.all(12),
+                                child: SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
                                 ),
-                              ),
-                            )
-                          : const Icon(Icons.tune_outlined),
+                              )
+                            : const Icon(Icons.tune_outlined),
+                      ),
+                      onTapOutside: (_) => FocusScope.of(context).unfocus(),
+                      onChanged: (_) => setState(() {}),
                     ),
-                    onChanged: (_) => setState(() {}),
-                  ),
-                  const SizedBox(height: 16),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      FilledButton.icon(
-                        onPressed: () {
-                          final parsed = double.tryParse(
-                            _rateController.text.trim(),
-                          );
-                          if (parsed == null || parsed <= 0) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Enter a valid rate.'),
+                    const SizedBox(height: 16),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilledButton.icon(
+                          onPressed: () {
+                            final parsed = double.tryParse(
+                              _rateController.text.trim(),
+                            );
+                            if (parsed == null || parsed <= 0) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('Enter a valid rate.'),
+                                ),
+                              );
+                              return;
+                            }
+
+                            widget.onTripChanged(
+                              widget.trip.copyWith(
+                                targetCurrency: _selectedCurrency,
+                                exchangeRateToMyr: parsed,
                               ),
                             );
-                            return;
-                          }
-
-                          widget.onTripChanged(
-                            widget.trip.copyWith(
-                              targetCurrency: _selectedCurrency,
-                              exchangeRateToMyr: parsed,
-                            ),
-                          );
-                        },
-                        icon: const Icon(Icons.save_outlined),
-                        label: const Text('Save rate'),
-                      ),
-                      FilledButton.tonalIcon(
-                        onPressed: _loadingRate ? null : _refreshRate,
-                        icon: const Icon(Icons.sync),
-                        label: const Text('Refresh'),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 16),
-          Card(
-            color: const Color(0xFFEAF6F2),
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '$fromCode ${_moneyFormatter.format(amount)}',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    '$toCode ${_moneyFormatter.format(converted)}',
-                    style: Theme.of(context).textTheme.displaySmall?.copyWith(
-                      fontWeight: FontWeight.w800,
+                          },
+                          icon: const Icon(Icons.save_outlined),
+                          label: const Text('Save rate'),
+                        ),
+                        FilledButton.tonalIcon(
+                          onPressed: _loadingRate ? null : _refreshRate,
+                          icon: const Icon(Icons.sync),
+                          label: const Text('Refresh'),
+                        ),
+                      ],
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
-          ),
-        ],
+            const SizedBox(height: 16),
+            Card(
+              color: const Color(0xFFEAF6F2),
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '$fromCode ${_moneyFormatter.format(amount)}',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '$toCode ${_moneyFormatter.format(converted)}',
+                      style: Theme.of(context).textTheme.displaySmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -2419,7 +2583,7 @@ class FilesTab extends StatefulWidget {
   });
 
   final TravelTrip trip;
-  final ValueChanged<TravelEvent?> onAddAttachment;
+  final AttachmentPickAction onAddAttachment;
   final ValueChanged<TravelAttachment> onOpenAttachment;
   final AttachmentAction onRemoveAttachment;
   final AttachmentMemberAction onUpdateAttachmentMembers;
@@ -2476,7 +2640,7 @@ class _FilesTabState extends State<FilesTab> {
       return EmptyTabView(
         icon: Icons.folder_open_outlined,
         title: widget.trip.events.isEmpty ? 'No events yet' : 'No files yet',
-        actionLabel: widget.trip.events.isEmpty ? null : 'Attach to event',
+        actionLabel: widget.trip.events.isEmpty ? null : 'Add',
         onAction: widget.trip.events.isEmpty
             ? null
             : () => widget.onAddAttachment(null),
@@ -2495,8 +2659,8 @@ class _FilesTabState extends State<FilesTab> {
             children: [
               FilledButton.icon(
                 onPressed: () => widget.onAddAttachment(null),
-                icon: const Icon(Icons.attach_file),
-                label: const Text('Attach to event'),
+                icon: const Icon(Icons.add),
+                label: const Text('Add'),
               ),
               if (widget.trip.members.isNotEmpty)
                 ChoiceChip(
@@ -2564,11 +2728,7 @@ class _AttachmentCard extends StatelessWidget {
 
     return Card(
       child: ListTile(
-        leading: Icon(
-          attachment.kind == AttachmentKind.photo
-              ? Icons.image_outlined
-              : Icons.insert_drive_file_outlined,
-        ),
+        leading: AttachmentThumbnail(attachment: attachment, size: 56),
         title: Text(
           attachment.name,
           maxLines: 2,
@@ -2606,6 +2766,179 @@ class _AttachmentCard extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+class AttachmentListTile extends StatelessWidget {
+  const AttachmentListTile({
+    super.key,
+    required this.trip,
+    required this.attachment,
+    required this.onOpen,
+    required this.onEditPinnedMembers,
+    required this.onRemove,
+  });
+
+  final TravelTrip trip;
+  final TravelAttachment attachment;
+  final VoidCallback onOpen;
+  final VoidCallback onEditPinnedMembers;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: AttachmentThumbnail(attachment: attachment, size: 48),
+      title: Text(
+        attachment.name,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '${_attachmentKindName(attachment.kind)} - ${_formatBytes(attachment.sizeBytes)}',
+          ),
+          MemberTagWrap(trip: trip, memberIds: attachment.memberIds),
+        ],
+      ),
+      onTap: onOpen,
+      trailing: SizedBox(
+        width: 96,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            IconButton(
+              tooltip: 'Pin members',
+              onPressed: onEditPinnedMembers,
+              icon: const Icon(Icons.person_pin_outlined),
+            ),
+            IconButton(
+              tooltip: 'Remove',
+              onPressed: onRemove,
+              icon: const Icon(Icons.delete_outline),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class PhotoAttachmentCard extends StatelessWidget {
+  const PhotoAttachmentCard({
+    super.key,
+    required this.trip,
+    required this.attachment,
+    required this.onOpen,
+    required this.onEditPinnedMembers,
+    required this.onRemove,
+  });
+
+  final TravelTrip trip;
+  final TravelAttachment attachment;
+  final VoidCallback onOpen;
+  final VoidCallback onEditPinnedMembers;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onOpen,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: AttachmentThumbnail(
+                attachment: attachment,
+                size: double.infinity,
+                borderRadius: BorderRadius.zero,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 6, 4),
+              child: Text(
+                attachment.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.labelLarge,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 0, 4, 6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _formatBytes(attachment.sizeBytes),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall,
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Pin members',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: onEditPinnedMembers,
+                    icon: const Icon(Icons.person_pin_outlined, size: 20),
+                  ),
+                  IconButton(
+                    tooltip: 'Remove',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: onRemove,
+                    icon: const Icon(Icons.delete_outline, size: 20),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class AttachmentThumbnail extends StatelessWidget {
+  const AttachmentThumbnail({
+    super.key,
+    required this.attachment,
+    required this.size,
+    this.borderRadius,
+  });
+
+  final TravelAttachment attachment;
+  final double size;
+  final BorderRadius? borderRadius;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final bytes = attachment.kind == AttachmentKind.photo
+        ? _attachmentBytes(attachment)
+        : null;
+    final radius = borderRadius ?? BorderRadius.circular(8);
+    final icon = attachment.kind == AttachmentKind.photo
+        ? Icons.image_outlined
+        : Icons.insert_drive_file_outlined;
+
+    return ClipRRect(
+      borderRadius: radius,
+      child: SizedBox(
+        width: size,
+        height: size,
+        child: bytes == null
+            ? ColoredBox(
+                color: colors.surfaceContainerHighest,
+                child: Icon(icon, color: colors.onSurfaceVariant),
+              )
+            : Image.memory(bytes, fit: BoxFit.cover),
       ),
     );
   }
@@ -2766,7 +3099,7 @@ class MemberTagWrap extends StatelessWidget {
   }
 }
 
-class EventFilesDialog extends StatelessWidget {
+class EventFilesDialog extends StatefulWidget {
   const EventFilesDialog({
     super.key,
     required this.trip,
@@ -2781,14 +3114,51 @@ class EventFilesDialog extends StatelessWidget {
   final TravelTrip trip;
   final TravelEvent event;
   final ValueChanged<TravelAttachment> onOpenAttachment;
-  final Future<void> Function() onAttachFile;
-  final Future<void> Function(ImageSource source) onPickPhoto;
+  final Future<TravelAttachment?> Function() onAttachFile;
+  final Future<TravelAttachment?> Function(ImageSource source) onPickPhoto;
   final Future<void> Function(TravelAttachment attachment) onRemoveAttachment;
   final Future<void> Function(
     TravelAttachment attachment,
     Set<String> memberIds,
   )
   onUpdateAttachmentMembers;
+
+  @override
+  State<EventFilesDialog> createState() => _EventFilesDialogState();
+}
+
+class _EventFilesDialogState extends State<EventFilesDialog>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+  late List<TravelAttachment> _attachments;
+
+  @override
+  void initState() {
+    super.initState();
+    _attachments = [...widget.event.attachments];
+    _tabController = TabController(length: 2, vsync: this);
+    _tabController.addListener(() {
+      if (mounted) {
+        setState(() {});
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  List<TravelAttachment> get _files => [
+    for (final attachment in _attachments)
+      if (attachment.kind == AttachmentKind.file) attachment,
+  ];
+
+  List<TravelAttachment> get _photos => [
+    for (final attachment in _attachments)
+      if (attachment.kind == AttachmentKind.photo) attachment,
+  ];
 
   Future<void> _editPinnedMembers(
     BuildContext context,
@@ -2798,7 +3168,7 @@ class EventFilesDialog extends StatelessWidget {
       context: context,
       builder: (context) => AttachmentMembersDialog(
         attachment: attachment,
-        members: trip.members,
+        members: widget.trip.members,
       ),
     );
 
@@ -2806,127 +3176,161 @@ class EventFilesDialog extends StatelessWidget {
       return;
     }
 
-    await onUpdateAttachmentMembers(attachment, memberIds);
-    if (context.mounted) {
-      Navigator.of(context).pop();
+    await widget.onUpdateAttachmentMembers(attachment, memberIds);
+    if (!mounted) {
+      return;
     }
+
+    setState(() {
+      _attachments = _attachments.map((candidate) {
+        if (candidate.id != attachment.id) {
+          return candidate;
+        }
+
+        return candidate.copyWith(memberIds: memberIds.toList());
+      }).toList();
+    });
+  }
+
+  Future<void> _addFile() async {
+    final attachment = await widget.onAttachFile();
+    if (attachment == null || !mounted) {
+      return;
+    }
+
+    setState(() => _attachments = [..._attachments, attachment]);
+  }
+
+  Future<void> _addPhoto() async {
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.photo_library_outlined),
+                title: const Text('Gallery'),
+                onTap: () => Navigator.of(context).pop(ImageSource.gallery),
+              ),
+              ListTile(
+                leading: const Icon(Icons.photo_camera_outlined),
+                title: const Text('Camera'),
+                onTap: () => Navigator.of(context).pop(ImageSource.camera),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    if (source == null) {
+      return;
+    }
+
+    final attachment = await widget.onPickPhoto(source);
+    if (attachment == null || !mounted) {
+      return;
+    }
+
+    setState(() => _attachments = [..._attachments, attachment]);
+  }
+
+  Future<void> _removeAttachment(TravelAttachment attachment) async {
+    await widget.onRemoveAttachment(attachment);
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _attachments = _attachments
+          .where((candidate) => candidate.id != attachment.id)
+          .toList();
+    });
+  }
+
+  Future<void> _handleAdd() {
+    return _tabController.index == 0 ? _addFile() : _addPhoto();
   }
 
   @override
   Widget build(BuildContext context) {
+    final selectedIsFiles = _tabController.index == 0;
+
     return AlertDialog(
-      title: Text('${event.title} files'),
+      title: Text('${widget.event.title} files'),
       content: SizedBox(
-        width: min(MediaQuery.sizeOf(context).width - 48, 520),
+        width: min(MediaQuery.sizeOf(context).width - 48, 560),
+        height: min(MediaQuery.sizeOf(context).height * 0.58, 460),
         child: Column(
-          mainAxisSize: MainAxisSize.min,
           children: [
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                FilledButton.icon(
-                  onPressed: () async {
-                    await onAttachFile();
-                    if (context.mounted) {
-                      Navigator.of(context).pop();
-                    }
-                  },
-                  icon: const Icon(Icons.attach_file),
-                  label: const Text('File'),
-                ),
-                FilledButton.tonalIcon(
-                  onPressed: () async {
-                    await onPickPhoto(ImageSource.gallery);
-                    if (context.mounted) {
-                      Navigator.of(context).pop();
-                    }
-                  },
-                  icon: const Icon(Icons.photo_library_outlined),
-                  label: const Text('Gallery'),
-                ),
-                FilledButton.tonalIcon(
-                  onPressed: () async {
-                    await onPickPhoto(ImageSource.camera);
-                    if (context.mounted) {
-                      Navigator.of(context).pop();
-                    }
-                  },
-                  icon: const Icon(Icons.photo_camera_outlined),
-                  label: const Text('Camera'),
-                ),
+            TabBar(
+              controller: _tabController,
+              tabs: const [
+                Tab(icon: Icon(Icons.attach_file), text: 'Files'),
+                Tab(icon: Icon(Icons.photo_library_outlined), text: 'Photos'),
               ],
             ),
-            const SizedBox(height: 16),
-            if (event.attachments.isEmpty)
-              const Padding(
-                padding: EdgeInsets.all(16),
-                child: Text('No files or photos yet'),
-              )
-            else
-              Flexible(
-                child: AppScrollbar(
-                  builder: (controller) => ListView.separated(
-                    controller: controller,
-                    shrinkWrap: true,
-                    itemCount: event.attachments.length,
-                    separatorBuilder: (context, index) =>
-                        const Divider(height: 1),
-                    itemBuilder: (context, index) {
-                      final attachment = event.attachments[index];
-                      return ListTile(
-                        leading: Icon(
-                          attachment.kind == AttachmentKind.photo
-                              ? Icons.image_outlined
-                              : Icons.insert_drive_file_outlined,
-                        ),
-                        title: Text(
-                          attachment.name,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        subtitle: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '${_attachmentKindName(attachment.kind)} - ${_formatBytes(attachment.sizeBytes)}',
-                            ),
-                            MemberTagWrap(
-                              trip: trip,
-                              memberIds: attachment.memberIds,
-                            ),
-                          ],
-                        ),
-                        onTap: () => onOpenAttachment(attachment),
-                        trailing: SizedBox(
-                          width: 96,
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.end,
-                            children: [
-                              IconButton(
-                                tooltip: 'Pin members',
-                                onPressed: () =>
+            const SizedBox(height: 12),
+            Expanded(
+              child: TabBarView(
+                controller: _tabController,
+                children: [
+                  _files.isEmpty
+                      ? const Center(child: Text('No files yet'))
+                      : AppScrollbar(
+                          builder: (controller) => ListView.separated(
+                            controller: controller,
+                            itemCount: _files.length,
+                            separatorBuilder: (context, index) =>
+                                const Divider(height: 1),
+                            itemBuilder: (context, index) {
+                              final attachment = _files[index];
+                              return AttachmentListTile(
+                                trip: widget.trip,
+                                attachment: attachment,
+                                onOpen: () =>
+                                    widget.onOpenAttachment(attachment),
+                                onEditPinnedMembers: () =>
                                     _editPinnedMembers(context, attachment),
-                                icon: const Icon(Icons.person_pin_outlined),
-                              ),
-                              IconButton(
-                                tooltip: 'Remove',
-                                onPressed: () async {
-                                  await onRemoveAttachment(attachment);
-                                  if (context.mounted) {
-                                    Navigator.of(context).pop();
-                                  }
-                                },
-                                icon: const Icon(Icons.delete_outline),
-                              ),
-                            ],
+                                onRemove: () => _removeAttachment(attachment),
+                              );
+                            },
                           ),
                         ),
-                      );
-                    },
-                  ),
-                ),
+                  _photos.isEmpty
+                      ? const Center(child: Text('No photos yet'))
+                      : AppScrollbar(
+                          builder: (controller) => GridView.builder(
+                            controller: controller,
+                            gridDelegate:
+                                const SliverGridDelegateWithMaxCrossAxisExtent(
+                                  maxCrossAxisExtent: 180,
+                                  mainAxisSpacing: 10,
+                                  crossAxisSpacing: 10,
+                                  childAspectRatio: 0.78,
+                                ),
+                            itemCount: _photos.length,
+                            itemBuilder: (context, index) {
+                              final attachment = _photos[index];
+                              return PhotoAttachmentCard(
+                                trip: widget.trip,
+                                attachment: attachment,
+                                onOpen: () =>
+                                    widget.onOpenAttachment(attachment),
+                                onEditPinnedMembers: () =>
+                                    _editPinnedMembers(context, attachment),
+                                onRemove: () => _removeAttachment(attachment),
+                              );
+                            },
+                          ),
+                        ),
+                ],
               ),
+            ),
           ],
         ),
       ),
@@ -2935,22 +3339,34 @@ class EventFilesDialog extends StatelessWidget {
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Close'),
         ),
+        FilledButton.icon(
+          onPressed: _handleAdd,
+          icon: Icon(
+            selectedIsFiles ? Icons.attach_file : Icons.add_photo_alternate,
+          ),
+          label: const Text('Add'),
+        ),
       ],
     );
   }
 }
 
 class AttachmentPreviewDialog extends StatelessWidget {
-  const AttachmentPreviewDialog({super.key, required this.attachment});
+  const AttachmentPreviewDialog({
+    super.key,
+    required this.attachment,
+    required this.onShare,
+  });
 
   final TravelAttachment attachment;
+  final Future<void> Function() onShare;
 
   @override
   Widget build(BuildContext context) {
-    final bytes = base64Decode(attachment.bytesBase64!);
+    final bytes = _attachmentBytes(attachment);
     final mimeType = attachment.mimeType ?? 'application/octet-stream';
-    final isImage = mimeType.startsWith('image/');
-    final isText = mimeType.startsWith('text/');
+    final isImage = bytes != null && mimeType.startsWith('image/');
+    final isText = bytes != null && mimeType.startsWith('text/');
 
     return AlertDialog(
       title: Text(
@@ -2993,14 +3409,11 @@ class AttachmentPreviewDialog extends StatelessWidget {
           child: const Text('Close'),
         ),
         FilledButton.icon(
-          onPressed: () {
-            launchUrl(
-              Uri.dataFromBytes(bytes, mimeType: mimeType),
-              mode: LaunchMode.externalApplication,
-            );
+          onPressed: () async {
+            await onShare();
           },
-          icon: const Icon(Icons.open_in_new),
-          label: const Text('Open'),
+          icon: const Icon(Icons.ios_share_outlined),
+          label: const Text('Share'),
         ),
       ],
     );

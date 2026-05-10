@@ -53,6 +53,8 @@
 	<string>Traveler uses the camera to save trip photos with events.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Traveler uses the photo library to attach trip photos to events.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Traveler saves camera photos to your photo library so trip memories are not lost.</string>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>
