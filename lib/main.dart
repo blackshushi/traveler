@@ -10,6 +10,8 @@ import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'clipboard_writer.dart';
+
 void main() {
   runApp(const TravelerApp());
 }
@@ -169,11 +171,16 @@ double _expenseAmountInTripCurrency(TravelTrip trip, TravelEvent event) {
   return _expenseAmountInMyr(trip, event) / targetRate;
 }
 
-List<TravelMember> _membersForIds(TravelTrip trip, Iterable<String> ids) {
+List<String> _memberTagLabelsForIds(TravelTrip trip, Iterable<String> ids) {
   final selectedIds = ids.toSet();
+  if (trip.members.isNotEmpty &&
+      trip.members.every((member) => selectedIds.contains(member.id))) {
+    return const ['All'];
+  }
+
   return [
     for (final member in trip.members)
-      if (selectedIds.contains(member.id)) member,
+      if (selectedIds.contains(member.id)) member.name,
   ];
 }
 
@@ -200,6 +207,80 @@ List<TravelTrip> _sortTripsByTime(List<TravelTrip> trips) {
   });
 
   return sorted;
+}
+
+String _shareDivider([int length = 42]) {
+  return '-' * length;
+}
+
+String _shareTitleLine(String title) {
+  return '------------- $title ---------------';
+}
+
+String _buildTripShareText(TravelTrip trip) {
+  final buffer = StringBuffer()
+    ..writeln(_shareTitleLine(trip.name))
+    ..writeln(
+      [
+        trip.country.isEmpty ? 'No location' : trip.country,
+        trip.dateRangeLabel,
+        trip.members.isEmpty
+            ? 'No members'
+            : trip.members.map((member) => member.name).join(', '),
+      ].join(', '),
+    )
+    ..writeln(_shareDivider());
+
+  DateTime? currentDay;
+  for (final event in trip.sortedEvents) {
+    final eventDay = DateTime(
+      event.startAt.year,
+      event.startAt.month,
+      event.startAt.day,
+    );
+    if (currentDay == null || !DateUtils.isSameDay(currentDay, eventDay)) {
+      if (currentDay != null) {
+        buffer.writeln(_shareDivider());
+      }
+      buffer.writeln(
+        '-------------- ${_dayFormatter.format(eventDay)} ------------------',
+      );
+      currentDay = eventDay;
+    }
+
+    buffer
+      ..writeln('${event.timeRangeLabel} - ${event.title}')
+      ..writeln(
+        'Location: ${event.location.isEmpty ? 'No location' : event.location}',
+      );
+    if (event.planNotes.isNotEmpty) {
+      buffer.writeln('Plan: ${event.planNotes}');
+    }
+    if (event.journal.isNotEmpty) {
+      buffer.writeln('Experience: ${event.journal}');
+    }
+    if (event.feeling.isNotEmpty) {
+      buffer.writeln('Feeling: ${event.feeling}');
+    }
+    if (event.expenseAmount > 0) {
+      final members = _memberTagLabelsForIds(trip, event.expenseMemberIds);
+      buffer.writeln(
+        [
+          'Expense: ${_formatMoney(event.expenseCurrencyCode, event.expenseAmount)}',
+          if (event.splitCount > 1) 'split ${event.splitCount} ways',
+          if (members.isNotEmpty) 'with ${members.join(', ')}',
+        ].join(' - '),
+      );
+    }
+    buffer.writeln();
+  }
+
+  if (trip.events.isEmpty) {
+    buffer.writeln('No plan yet.');
+  }
+
+  buffer.writeln(_shareDivider(41));
+  return buffer.toString().trimRight();
 }
 
 class TravelerApp extends StatelessWidget {
@@ -762,6 +843,25 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     }
   }
 
+  Future<void> _shareTrip(TravelTrip trip) async {
+    try {
+      await copyTextToClipboard(_buildTripShareText(trip));
+    } on Object {
+      if (!mounted) {
+        return;
+      }
+
+      _showSnack('Could not copy the trip plan. Please try again.');
+      return;
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    _showSnack('Trip plan copied. Paste it anywhere.');
+  }
+
   void _showSnack(String message) {
     ScaffoldMessenger.of(
       context,
@@ -819,6 +919,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                             onManageMembers: () =>
                                 _showMembersDialog(selectedTrip),
                             onDeleteTrip: () => _deleteTrip(selectedTrip),
+                            onShareTrip: () => _shareTrip(selectedTrip),
                             onAddEvent: () => _showEventDialog(selectedTrip),
                             onEditEvent: (event) =>
                                 _showEventDialog(selectedTrip, event: event),
@@ -869,6 +970,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                 onEditTrip: () => _showTripDialog(trip: selectedTrip),
                 onManageMembers: () => _showMembersDialog(selectedTrip),
                 onDeleteTrip: () => _deleteTrip(selectedTrip),
+                onShareTrip: () => _shareTrip(selectedTrip),
                 onAddEvent: () => _showEventDialog(selectedTrip),
                 onEditEvent: (event) =>
                     _showEventDialog(selectedTrip, event: event),
@@ -935,6 +1037,76 @@ class EmptyTripsView extends StatelessWidget {
   }
 }
 
+class AppScrollbar extends StatefulWidget {
+  const AppScrollbar({super.key, required this.builder});
+
+  final Widget Function(ScrollController controller) builder;
+
+  @override
+  State<AppScrollbar> createState() => _AppScrollbarState();
+}
+
+class _AppScrollbarState extends State<AppScrollbar> {
+  final _controller = ScrollController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scrollbar(
+      controller: _controller,
+      thumbVisibility: true,
+      interactive: true,
+      child: widget.builder(_controller),
+    );
+  }
+}
+
+class ResponsiveFieldRow extends StatelessWidget {
+  const ResponsiveFieldRow({
+    super.key,
+    required this.children,
+    this.breakpoint = 520,
+    this.spacing = 12,
+  });
+
+  final List<Widget> children;
+  final double breakpoint;
+  final double spacing;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth < breakpoint) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              for (var index = 0; index < children.length; index++) ...[
+                children[index],
+                if (index != children.length - 1) SizedBox(height: spacing),
+              ],
+            ],
+          );
+        }
+
+        return Row(
+          children: [
+            for (var index = 0; index < children.length; index++) ...[
+              Expanded(child: children[index]),
+              if (index != children.length - 1) SizedBox(width: spacing),
+            ],
+          ],
+        );
+      },
+    );
+  }
+}
+
 class TripListPane extends StatelessWidget {
   const TripListPane({
     super.key,
@@ -953,56 +1125,59 @@ class TripListPane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ListView.separated(
-      padding: const EdgeInsets.fromLTRB(12, 16, 12, 16),
-      itemCount: trips.length,
-      separatorBuilder: (context, index) => const SizedBox(height: 8),
-      itemBuilder: (context, index) {
-        final trip = trips[index];
-        final selected = trip.id == selectedTripId;
-        final colors = Theme.of(context).colorScheme;
+    return AppScrollbar(
+      builder: (controller) => ListView.separated(
+        controller: controller,
+        padding: const EdgeInsets.fromLTRB(12, 16, 16, 16),
+        itemCount: trips.length,
+        separatorBuilder: (context, index) => const SizedBox(height: 8),
+        itemBuilder: (context, index) {
+          final trip = trips[index];
+          final selected = trip.id == selectedTripId;
+          final colors = Theme.of(context).colorScheme;
 
-        return Card(
-          clipBehavior: Clip.antiAlias,
-          color: selected ? colors.primaryContainer : colors.surface,
-          child: ListTile(
-            selected: selected,
-            onTap: () => onSelect(trip),
-            onLongPress: () => onEdit(trip),
-            leading: CircleAvatar(
-              backgroundColor: selected
-                  ? colors.primary
-                  : const Color(0xFFE76F51),
-              foregroundColor: Colors.white,
-              child: Text(
-                trip.name.trim().isEmpty
-                    ? '?'
-                    : trip.name.trim().characters.first.toUpperCase(),
+          return Card(
+            clipBehavior: Clip.antiAlias,
+            color: selected ? colors.primaryContainer : colors.surface,
+            child: ListTile(
+              selected: selected,
+              onTap: () => onSelect(trip),
+              onLongPress: () => onEdit(trip),
+              leading: CircleAvatar(
+                backgroundColor: selected
+                    ? colors.primary
+                    : const Color(0xFFE76F51),
+                foregroundColor: Colors.white,
+                child: Text(
+                  trip.name.trim().isEmpty
+                      ? '?'
+                      : trip.name.trim().characters.first.toUpperCase(),
+                ),
+              ),
+              title: Text(
+                trip.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: Text(
+                [
+                  trip.dateRangeLabel,
+                  if (trip.country.isNotEmpty) trip.country,
+                  trip.targetCurrency,
+                  '${trip.events.length} events',
+                ].join(' - '),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: IconButton(
+                tooltip: 'Delete trip',
+                onPressed: () => onDelete(trip),
+                icon: const Icon(Icons.delete_outline),
               ),
             ),
-            title: Text(
-              trip.name,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            subtitle: Text(
-              [
-                trip.dateRangeLabel,
-                if (trip.country.isNotEmpty) trip.country,
-                trip.targetCurrency,
-                '${trip.events.length} events',
-              ].join(' - '),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-            trailing: IconButton(
-              tooltip: 'Delete trip',
-              onPressed: () => onDelete(trip),
-              icon: const Icon(Icons.delete_outline),
-            ),
-          ),
-        );
-      },
+          );
+        },
+      ),
     );
   }
 }
@@ -1014,6 +1189,7 @@ class TripDetailView extends StatelessWidget {
     required this.onEditTrip,
     required this.onManageMembers,
     required this.onDeleteTrip,
+    required this.onShareTrip,
     required this.onAddEvent,
     required this.onEditEvent,
     required this.onOpenEventActions,
@@ -1034,6 +1210,7 @@ class TripDetailView extends StatelessWidget {
   final VoidCallback onEditTrip;
   final VoidCallback onManageMembers;
   final VoidCallback onDeleteTrip;
+  final VoidCallback onShareTrip;
   final VoidCallback onAddEvent;
   final ValueChanged<TravelEvent> onEditEvent;
   final ValueChanged<TravelEvent> onOpenEventActions;
@@ -1059,6 +1236,7 @@ class TripDetailView extends StatelessWidget {
             onEdit: onEditTrip,
             onManageMembers: onManageMembers,
             onDelete: onDeleteTrip,
+            onShare: onShareTrip,
           ),
           const TabBar(
             tabs: [
@@ -1105,6 +1283,7 @@ class TripHeader extends StatelessWidget {
     required this.onEdit,
     required this.onManageMembers,
     required this.onDelete,
+    required this.onShare,
     this.onBack,
   });
 
@@ -1113,6 +1292,7 @@ class TripHeader extends StatelessWidget {
   final VoidCallback onEdit;
   final VoidCallback onManageMembers;
   final VoidCallback onDelete;
+  final VoidCallback onShare;
   final VoidCallback? onBack;
 
   @override
@@ -1181,6 +1361,11 @@ class TripHeader extends StatelessWidget {
             tooltip: 'Trip members',
             onPressed: onManageMembers,
             icon: const Icon(Icons.group_outlined),
+          ),
+          IconButton(
+            tooltip: 'Share plan',
+            onPressed: onShare,
+            icon: const Icon(Icons.ios_share_outlined),
           ),
           IconButton(
             tooltip: 'Delete trip',
@@ -1269,9 +1454,12 @@ class PlanTab extends StatelessWidget {
             onAction: onAddEvent,
           )
         else
-          ListView(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
-            children: children,
+          AppScrollbar(
+            builder: (controller) => ListView(
+              controller: controller,
+              padding: const EdgeInsets.fromLTRB(16, 16, 20, 88),
+              children: children,
+            ),
           ),
         Positioned(
           right: 16,
@@ -1647,18 +1835,21 @@ class JournalTab extends StatelessWidget {
       );
     }
 
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-      children: [
-        ExpenseSummaryCard(trip: trip),
-        const SizedBox(height: 12),
-        for (final event in events)
-          JournalEventCard(
-            trip: trip,
-            event: event,
-            onTap: () => onOpenEventActions(event),
-          ),
-      ],
+    return AppScrollbar(
+      builder: (controller) => ListView(
+        controller: controller,
+        padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
+        children: [
+          ExpenseSummaryCard(trip: trip),
+          const SizedBox(height: 12),
+          for (final event in events)
+            JournalEventCard(
+              trip: trip,
+              event: event,
+              onTap: () => onOpenEventActions(event),
+            ),
+        ],
+      ),
     );
   }
 }
@@ -1677,27 +1868,37 @@ class ExpenseSummaryCard extends StatelessWidget {
       color: const Color(0xFFFFF4E8),
       child: Padding(
         padding: const EdgeInsets.all(16),
-        child: Row(
+        child: Wrap(
+          spacing: 12,
+          runSpacing: 10,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          alignment: WrapAlignment.spaceBetween,
           children: [
-            const Icon(Icons.account_balance_wallet_outlined),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Expenses',
-                    style: Theme.of(context).textTheme.titleMedium,
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.account_balance_wallet_outlined),
+                const SizedBox(width: 12),
+                Flexible(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Expenses',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _formatMoney(trip.targetCurrency, totalTarget),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.headlineSmall
+                            ?.copyWith(fontWeight: FontWeight.w800),
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 4),
-                  Text(
-                    _formatMoney(trip.targetCurrency, totalTarget),
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                ],
-              ),
+                ),
+              ],
             ),
             Text(
               'MYR ${_moneyFormatter.format(totalMyr)}',
@@ -1856,7 +2057,7 @@ class JournalBillPanel extends StatelessWidget {
     final perPerson = event.splitCount <= 1
         ? event.expenseAmount
         : event.expenseAmount / event.splitCount;
-    final splitMembers = _membersForIds(trip, event.expenseMemberIds);
+    final splitLabels = _memberTagLabelsForIds(trip, event.expenseMemberIds);
 
     return Container(
       width: double.infinity,
@@ -1869,32 +2070,16 @@ class JournalBillPanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Icon(
-                Icons.receipt_long_outlined,
-                size: 20,
-                color: colors.primary,
+          Align(
+            alignment: Alignment.centerRight,
+            child: Text(
+              _formatMoney(event.expenseCurrencyCode, event.expenseAmount),
+              style: theme.textTheme.titleMedium?.copyWith(
+                fontWeight: FontWeight.w800,
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Bill',
-                  style: theme.textTheme.labelLarge?.copyWith(
-                    color: colors.onSurfaceVariant,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-              Text(
-                _formatMoney(event.expenseCurrencyCode, event.expenseAmount),
-                style: theme.textTheme.titleMedium?.copyWith(
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ],
+            ),
           ),
-          if (event.splitCount > 1 || splitMembers.isNotEmpty) ...[
+          if (event.splitCount > 1 || splitLabels.isNotEmpty) ...[
             const SizedBox(height: 10),
             Wrap(
               spacing: 8,
@@ -1907,10 +2092,12 @@ class JournalBillPanel extends StatelessWidget {
                     text:
                         '${_formatMoney(event.expenseCurrencyCode, perPerson)} each',
                   ),
-                for (final member in splitMembers)
+                for (final label in splitLabels)
                   _JournalBillPill(
-                    icon: Icons.person_outline,
-                    text: member.name,
+                    icon: label == 'All'
+                        ? Icons.groups_outlined
+                        : Icons.person_outline,
+                    text: label,
                   ),
               ],
             ),
@@ -1943,7 +2130,14 @@ class _JournalBillPill extends StatelessWidget {
         children: [
           Icon(icon, size: 16, color: colors.primary),
           const SizedBox(width: 5),
-          Text(text, style: Theme.of(context).textTheme.labelMedium),
+          Flexible(
+            child: Text(
+              text,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.labelMedium,
+            ),
+          ),
         ],
       ),
     );
@@ -2055,156 +2249,161 @@ class _CurrencyTabState extends State<CurrencyTab> {
     final fromCode = _fromTarget ? _selectedCurrency : 'MYR';
     final toCode = _fromTarget ? 'MYR' : _selectedCurrency;
 
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-      children: [
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Text(
-                  'Converter',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: 16),
-                DropdownButtonFormField<String>(
-                  key: ValueKey('converter_$_selectedCurrency'),
-                  initialValue: _selectedCurrency,
-                  decoration: const InputDecoration(
-                    labelText: 'Trip currency',
-                    prefixIcon: Icon(Icons.payments_outlined),
+    return AppScrollbar(
+      builder: (controller) => ListView(
+        controller: controller,
+        padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    'Converter',
+                    style: Theme.of(context).textTheme.titleLarge,
                   ),
-                  items: [
-                    for (final currency in _supportedCurrencies)
-                      DropdownMenuItem(
-                        value: currency.code,
-                        child: Text(currency.label),
+                  const SizedBox(height: 16),
+                  DropdownButtonFormField<String>(
+                    key: ValueKey('converter_$_selectedCurrency'),
+                    initialValue: _selectedCurrency,
+                    decoration: const InputDecoration(
+                      labelText: 'Trip currency',
+                      prefixIcon: Icon(Icons.payments_outlined),
+                    ),
+                    items: [
+                      for (final currency in _supportedCurrencies)
+                        DropdownMenuItem(
+                          value: currency.code,
+                          child: Text(currency.label),
+                        ),
+                    ],
+                    onChanged: (value) {
+                      if (value != null) {
+                        _selectCurrency(value);
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 16),
+                  SegmentedButton<bool>(
+                    segments: [
+                      ButtonSegment(
+                        value: true,
+                        icon: const Icon(Icons.arrow_forward),
+                        label: Text('$_selectedCurrency to MYR'),
                       ),
-                  ],
-                  onChanged: (value) {
-                    if (value != null) {
-                      _selectCurrency(value);
-                    }
-                  },
-                ),
-                const SizedBox(height: 16),
-                SegmentedButton<bool>(
-                  segments: [
-                    ButtonSegment(
-                      value: true,
-                      icon: const Icon(Icons.arrow_forward),
-                      label: Text('$_selectedCurrency to MYR'),
+                      ButtonSegment(
+                        value: false,
+                        icon: const Icon(Icons.arrow_back),
+                        label: Text('MYR to $_selectedCurrency'),
+                      ),
+                    ],
+                    selected: {_fromTarget},
+                    onSelectionChanged: (value) {
+                      setState(() => _fromTarget = value.first);
+                    },
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: _amountController,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
                     ),
-                    ButtonSegment(
-                      value: false,
-                      icon: const Icon(Icons.arrow_back),
-                      label: Text('MYR to $_selectedCurrency'),
+                    decoration: InputDecoration(
+                      labelText: 'Amount in $fromCode',
+                      prefixIcon: const Icon(Icons.calculate_outlined),
                     ),
-                  ],
-                  selected: {_fromTarget},
-                  onSelectionChanged: (value) {
-                    setState(() => _fromTarget = value.first);
-                  },
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: _amountController,
-                  keyboardType: const TextInputType.numberWithOptions(
-                    decimal: true,
+                    onChanged: (_) => setState(() {}),
                   ),
-                  decoration: InputDecoration(
-                    labelText: 'Amount in $fromCode',
-                    prefixIcon: const Icon(Icons.calculate_outlined),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _rateController,
+                    keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true,
+                    ),
+                    decoration: InputDecoration(
+                      labelText: '1 $_selectedCurrency in MYR',
+                      prefixIcon: _loadingRate
+                          ? const Padding(
+                              padding: EdgeInsets.all(12),
+                              child: SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              ),
+                            )
+                          : const Icon(Icons.tune_outlined),
+                    ),
+                    onChanged: (_) => setState(() {}),
                   ),
-                  onChanged: (_) => setState(() {}),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _rateController,
-                  keyboardType: const TextInputType.numberWithOptions(
-                    decimal: true,
-                  ),
-                  decoration: InputDecoration(
-                    labelText: '1 $_selectedCurrency in MYR',
-                    prefixIcon: _loadingRate
-                        ? const Padding(
-                            padding: EdgeInsets.all(12),
-                            child: SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            ),
-                          )
-                        : const Icon(Icons.tune_outlined),
-                  ),
-                  onChanged: (_) => setState(() {}),
-                ),
-                const SizedBox(height: 16),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    FilledButton.icon(
-                      onPressed: () {
-                        final parsed = double.tryParse(
-                          _rateController.text.trim(),
-                        );
-                        if (parsed == null || parsed <= 0) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('Enter a valid rate.'),
+                  const SizedBox(height: 16),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      FilledButton.icon(
+                        onPressed: () {
+                          final parsed = double.tryParse(
+                            _rateController.text.trim(),
+                          );
+                          if (parsed == null || parsed <= 0) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Enter a valid rate.'),
+                              ),
+                            );
+                            return;
+                          }
+
+                          widget.onTripChanged(
+                            widget.trip.copyWith(
+                              targetCurrency: _selectedCurrency,
+                              exchangeRateToMyr: parsed,
                             ),
                           );
-                          return;
-                        }
-
-                        widget.onTripChanged(
-                          widget.trip.copyWith(
-                            targetCurrency: _selectedCurrency,
-                            exchangeRateToMyr: parsed,
-                          ),
-                        );
-                      },
-                      icon: const Icon(Icons.save_outlined),
-                      label: const Text('Save rate'),
-                    ),
-                    FilledButton.tonalIcon(
-                      onPressed: _loadingRate ? null : _refreshRate,
-                      icon: const Icon(Icons.sync),
-                      label: const Text('Refresh'),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 16),
-        Card(
-          color: const Color(0xFFEAF6F2),
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '$fromCode ${_moneyFormatter.format(amount)}',
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '$toCode ${_moneyFormatter.format(converted)}',
-                  style: Theme.of(context).textTheme.displaySmall?.copyWith(
-                    fontWeight: FontWeight.w800,
+                        },
+                        icon: const Icon(Icons.save_outlined),
+                        label: const Text('Save rate'),
+                      ),
+                      FilledButton.tonalIcon(
+                        onPressed: _loadingRate ? null : _refreshRate,
+                        icon: const Icon(Icons.sync),
+                        label: const Text('Refresh'),
+                      ),
+                    ],
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
-        ),
-      ],
+          const SizedBox(height: 16),
+          Card(
+            color: const Color(0xFFEAF6F2),
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '$fromCode ${_moneyFormatter.format(amount)}',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '$toCode ${_moneyFormatter.format(converted)}',
+                    style: Theme.of(context).textTheme.displaySmall?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -2284,59 +2483,62 @@ class _FilesTabState extends State<FilesTab> {
       );
     }
 
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-      children: [
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          children: [
-            FilledButton.icon(
-              onPressed: () => widget.onAddAttachment(null),
-              icon: const Icon(Icons.attach_file),
-              label: const Text('Attach to event'),
-            ),
-            if (widget.trip.members.isNotEmpty)
-              ChoiceChip(
-                label: const Text('All'),
-                selected: activeMemberId == null,
-                onSelected: (_) => setState(() => _selectedMemberId = null),
+    return AppScrollbar(
+      builder: (controller) => ListView(
+        controller: controller,
+        padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
+        children: [
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              FilledButton.icon(
+                onPressed: () => widget.onAddAttachment(null),
+                icon: const Icon(Icons.attach_file),
+                label: const Text('Attach to event'),
               ),
-            for (final member in widget.trip.members)
-              ChoiceChip(
-                avatar: const Icon(Icons.person_outline, size: 18),
-                label: Text(member.name),
-                selected: activeMemberId == member.id,
-                onSelected: (_) =>
-                    setState(() => _selectedMemberId = member.id),
+              if (widget.trip.members.isNotEmpty)
+                ChoiceChip(
+                  label: const Text('All'),
+                  selected: activeMemberId == null,
+                  onSelected: (_) => setState(() => _selectedMemberId = null),
+                ),
+              for (final member in widget.trip.members)
+                ChoiceChip(
+                  avatar: const Icon(Icons.person_outline, size: 18),
+                  label: Text(member.name),
+                  selected: activeMemberId == member.id,
+                  onSelected: (_) =>
+                      setState(() => _selectedMemberId = member.id),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          if (items.isEmpty)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  activeMemberId == null
+                      ? 'No files yet'
+                      : 'No files pinned to this traveler',
+                ),
               ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        if (items.isEmpty)
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text(
-                activeMemberId == null
-                    ? 'No files yet'
-                    : 'No files pinned to this traveler',
+            )
+          else
+            for (final item in items) ...[
+              _AttachmentCard(
+                trip: widget.trip,
+                item: item,
+                onOpenAttachment: widget.onOpenAttachment,
+                onRemoveAttachment: widget.onRemoveAttachment,
+                onEditPinnedMembers: _editPinnedMembers,
               ),
-            ),
-          )
-        else
-          for (final item in items) ...[
-            _AttachmentCard(
-              trip: widget.trip,
-              item: item,
-              onOpenAttachment: widget.onOpenAttachment,
-              onRemoveAttachment: widget.onRemoveAttachment,
-              onEditPinnedMembers: _editPinnedMembers,
-            ),
-            const SizedBox(height: 8),
-          ],
-      ],
+              const SizedBox(height: 8),
+            ],
+        ],
+      ),
     );
   }
 }
@@ -2359,7 +2561,6 @@ class _AttachmentCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final attachment = item.attachment;
-    final pinnedMembers = _membersForIds(trip, attachment.memberIds);
 
     return Card(
       child: ListTile(
@@ -2383,7 +2584,7 @@ class _AttachmentCard extends StatelessWidget {
                 _shortDayFormatter.format(attachment.addedAt),
               ].join(' - '),
             ),
-            MemberTagWrap(members: pinnedMembers),
+            MemberTagWrap(trip: trip, memberIds: attachment.memberIds),
           ],
         ),
         onTap: () => onOpenAttachment(attachment),
@@ -2428,19 +2629,22 @@ class AttachmentTargetDialog extends StatelessWidget {
       title: const Text('Attach to event'),
       content: SizedBox(
         width: min(MediaQuery.sizeOf(context).width - 48, 420),
-        child: ListView.separated(
-          shrinkWrap: true,
-          itemCount: events.length,
-          separatorBuilder: (context, index) => const Divider(height: 1),
-          itemBuilder: (context, index) {
-            final event = events[index];
-            return ListTile(
-              leading: const Icon(Icons.event_outlined),
-              title: Text(event.title),
-              subtitle: Text(_dayFormatter.format(event.startAt)),
-              onTap: () => Navigator.of(context).pop(event),
-            );
-          },
+        child: AppScrollbar(
+          builder: (controller) => ListView.separated(
+            controller: controller,
+            shrinkWrap: true,
+            itemCount: events.length,
+            separatorBuilder: (context, index) => const Divider(height: 1),
+            itemBuilder: (context, index) {
+              final event = events[index];
+              return ListTile(
+                leading: const Icon(Icons.event_outlined),
+                title: Text(event.title),
+                subtitle: Text(_dayFormatter.format(event.startAt)),
+                onTap: () => Navigator.of(context).pop(event),
+              );
+            },
+          ),
         ),
       ),
       actions: [
@@ -2529,13 +2733,15 @@ class _AttachmentMembersDialogState extends State<AttachmentMembersDialog> {
 }
 
 class MemberTagWrap extends StatelessWidget {
-  const MemberTagWrap({super.key, required this.members});
+  const MemberTagWrap({super.key, required this.trip, required this.memberIds});
 
-  final List<TravelMember> members;
+  final TravelTrip trip;
+  final Iterable<String> memberIds;
 
   @override
   Widget build(BuildContext context) {
-    if (members.isEmpty) {
+    final labels = _memberTagLabelsForIds(trip, memberIds);
+    if (labels.isEmpty) {
       return const SizedBox.shrink();
     }
 
@@ -2545,10 +2751,13 @@ class MemberTagWrap extends StatelessWidget {
         spacing: 6,
         runSpacing: 4,
         children: [
-          for (final member in members)
+          for (final label in labels)
             Chip(
-              avatar: const Icon(Icons.person_outline, size: 16),
-              label: Text(member.name),
+              avatar: Icon(
+                label == 'All' ? Icons.groups_outlined : Icons.person_outline,
+                size: 16,
+              ),
+              label: Text(label),
               visualDensity: VisualDensity.compact,
             ),
         ],
@@ -2656,64 +2865,66 @@ class EventFilesDialog extends StatelessWidget {
               )
             else
               Flexible(
-                child: ListView.separated(
-                  shrinkWrap: true,
-                  itemCount: event.attachments.length,
-                  separatorBuilder: (context, index) =>
-                      const Divider(height: 1),
-                  itemBuilder: (context, index) {
-                    final attachment = event.attachments[index];
-                    final pinnedMembers = _membersForIds(
-                      trip,
-                      attachment.memberIds,
-                    );
-                    return ListTile(
-                      leading: Icon(
-                        attachment.kind == AttachmentKind.photo
-                            ? Icons.image_outlined
-                            : Icons.insert_drive_file_outlined,
-                      ),
-                      title: Text(
-                        attachment.name,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      subtitle: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '${_attachmentKindName(attachment.kind)} - ${_formatBytes(attachment.sizeBytes)}',
-                          ),
-                          MemberTagWrap(members: pinnedMembers),
-                        ],
-                      ),
-                      onTap: () => onOpenAttachment(attachment),
-                      trailing: SizedBox(
-                        width: 96,
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.end,
+                child: AppScrollbar(
+                  builder: (controller) => ListView.separated(
+                    controller: controller,
+                    shrinkWrap: true,
+                    itemCount: event.attachments.length,
+                    separatorBuilder: (context, index) =>
+                        const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final attachment = event.attachments[index];
+                      return ListTile(
+                        leading: Icon(
+                          attachment.kind == AttachmentKind.photo
+                              ? Icons.image_outlined
+                              : Icons.insert_drive_file_outlined,
+                        ),
+                        title: Text(
+                          attachment.name,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            IconButton(
-                              tooltip: 'Pin members',
-                              onPressed: () =>
-                                  _editPinnedMembers(context, attachment),
-                              icon: const Icon(Icons.person_pin_outlined),
+                            Text(
+                              '${_attachmentKindName(attachment.kind)} - ${_formatBytes(attachment.sizeBytes)}',
                             ),
-                            IconButton(
-                              tooltip: 'Remove',
-                              onPressed: () async {
-                                await onRemoveAttachment(attachment);
-                                if (context.mounted) {
-                                  Navigator.of(context).pop();
-                                }
-                              },
-                              icon: const Icon(Icons.delete_outline),
+                            MemberTagWrap(
+                              trip: trip,
+                              memberIds: attachment.memberIds,
                             ),
                           ],
                         ),
-                      ),
-                    );
-                  },
+                        onTap: () => onOpenAttachment(attachment),
+                        trailing: SizedBox(
+                          width: 96,
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [
+                              IconButton(
+                                tooltip: 'Pin members',
+                                onPressed: () =>
+                                    _editPinnedMembers(context, attachment),
+                                icon: const Icon(Icons.person_pin_outlined),
+                              ),
+                              IconButton(
+                                tooltip: 'Remove',
+                                onPressed: () async {
+                                  await onRemoveAttachment(attachment);
+                                  if (context.mounted) {
+                                    Navigator.of(context).pop();
+                                  }
+                                },
+                                icon: const Icon(Icons.delete_outline),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
                 ),
               ),
           ],
@@ -2757,8 +2968,11 @@ class AttachmentPreviewDialog extends StatelessWidget {
             : isText
             ? ConstrainedBox(
                 constraints: const BoxConstraints(maxHeight: 360),
-                child: SingleChildScrollView(
-                  child: Text(utf8.decode(bytes, allowMalformed: true)),
+                child: AppScrollbar(
+                  builder: (controller) => SingleChildScrollView(
+                    controller: controller,
+                    child: Text(utf8.decode(bytes, allowMalformed: true)),
+                  ),
                 ),
               )
             : Column(
@@ -2868,30 +3082,33 @@ class _MembersDialogState extends State<MembersDialog> {
               )
             else
               Flexible(
-                child: ListView.separated(
-                  shrinkWrap: true,
-                  itemCount: _members.length,
-                  separatorBuilder: (context, index) =>
-                      const Divider(height: 1),
-                  itemBuilder: (context, index) {
-                    final member = _members[index];
-                    return ListTile(
-                      leading: const Icon(Icons.person_outline),
-                      title: Text(member.name),
-                      trailing: IconButton(
-                        tooltip: 'Remove member',
-                        onPressed: () {
-                          setState(() {
-                            _members = [
-                              ..._members.take(index),
-                              ..._members.skip(index + 1),
-                            ];
-                          });
-                        },
-                        icon: const Icon(Icons.delete_outline),
-                      ),
-                    );
-                  },
+                child: AppScrollbar(
+                  builder: (controller) => ListView.separated(
+                    controller: controller,
+                    shrinkWrap: true,
+                    itemCount: _members.length,
+                    separatorBuilder: (context, index) =>
+                        const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final member = _members[index];
+                      return ListTile(
+                        leading: const Icon(Icons.person_outline),
+                        title: Text(member.name),
+                        trailing: IconButton(
+                          tooltip: 'Remove member',
+                          onPressed: () {
+                            setState(() {
+                              _members = [
+                                ..._members.take(index),
+                                ..._members.skip(index + 1),
+                              ];
+                            });
+                          },
+                          icon: const Icon(Icons.delete_outline),
+                        ),
+                      );
+                    },
+                  ),
                 ),
               ),
           ],
@@ -3107,33 +3324,34 @@ class _TripFormDialogState extends State<TripFormDialog> {
         width: min(MediaQuery.sizeOf(context).width - 48, 520),
         child: Form(
           key: _formKey,
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextFormField(
-                  controller: _nameController,
-                  decoration: const InputDecoration(
-                    labelText: 'Trip name',
-                    prefixIcon: Icon(Icons.title),
+          child: AppScrollbar(
+            builder: (controller) => SingleChildScrollView(
+              controller: controller,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextFormField(
+                    controller: _nameController,
+                    decoration: const InputDecoration(
+                      labelText: 'Trip name',
+                      prefixIcon: Icon(Icons.title),
+                    ),
+                    textInputAction: TextInputAction.next,
+                    validator: _requiredValidator,
                   ),
-                  textInputAction: TextInputAction.next,
-                  validator: _requiredValidator,
-                ),
-                const SizedBox(height: 12),
-                TextFormField(
-                  controller: _countryController,
-                  decoration: const InputDecoration(
-                    labelText: 'Country',
-                    prefixIcon: Icon(Icons.place_outlined),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _countryController,
+                    decoration: const InputDecoration(
+                      labelText: 'Country',
+                      prefixIcon: Icon(Icons.place_outlined),
+                    ),
+                    textInputAction: TextInputAction.next,
                   ),
-                  textInputAction: TextInputAction.next,
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: DropdownButtonFormField<String>(
+                  const SizedBox(height: 12),
+                  ResponsiveFieldRow(
+                    children: [
+                      DropdownButtonFormField<String>(
                         key: ValueKey('trip_$_selectedCurrency'),
                         initialValue: _selectedCurrency,
                         decoration: const InputDecoration(
@@ -3153,10 +3371,7 @@ class _TripFormDialogState extends State<TripFormDialog> {
                           }
                         },
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: TextFormField(
+                      TextFormField(
                         controller: _rateController,
                         decoration: InputDecoration(
                           labelText: 'Rate to MYR',
@@ -3178,30 +3393,25 @@ class _TripFormDialogState extends State<TripFormDialog> {
                         ),
                         validator: _positiveNumberValidator,
                       ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: DatePickButton(
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  ResponsiveFieldRow(
+                    children: [
+                      DatePickButton(
                         label: 'Start',
                         value: _startDate,
                         onTap: () => _pickDate(isStart: true),
                       ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: DatePickButton(
+                      DatePickButton(
                         label: 'End',
                         value: _endDate,
                         onTap: () => _pickDate(isStart: false),
                       ),
-                    ),
-                  ],
-                ),
-              ],
+                    ],
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -3269,6 +3479,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
           ? ''
           : event.expenseAmount.toStringAsFixed(2),
     );
+    _expenseController.addListener(_handleExpenseAmountChanged);
     _splitController = TextEditingController(
       text: (event?.splitCount ?? 1).toString(),
     );
@@ -3286,6 +3497,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
 
   @override
   void dispose() {
+    _expenseController.removeListener(_handleExpenseAmountChanged);
     _titleController.dispose();
     _locationController.dispose();
     _durationController.dispose();
@@ -3295,6 +3507,12 @@ class _EventFormDialogState extends State<EventFormDialog> {
     _expenseController.dispose();
     _splitController.dispose();
     super.dispose();
+  }
+
+  void _handleExpenseAmountChanged() {
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   Future<void> _pickDate() async {
@@ -3384,6 +3602,23 @@ class _EventFormDialogState extends State<EventFormDialog> {
     );
   }
 
+  String _convertedExpensePreview() {
+    final amount = double.tryParse(_expenseController.text.trim()) ?? 0;
+    if (amount <= 0) {
+      return 'Enter an amount to preview conversion';
+    }
+
+    final fromCode = _currencyForCode(_selectedExpenseCurrency).code;
+    final tripCurrency = _currencyForCode(widget.trip.targetCurrency).code;
+    if (fromCode == 'MYR') {
+      final converted = amount / max(widget.trip.exchangeRateToMyr, 0.000001);
+      return 'Approx. ${_formatMoney(tripCurrency, converted)}';
+    }
+
+    final converted = amount * _rateToMyrForCurrency(widget.trip, fromCode);
+    return 'Approx. ${_formatMoney('MYR', converted)}';
+  }
+
   @override
   Widget build(BuildContext context) {
     final isPlanMode = widget.mode == EventFormMode.plan;
@@ -3403,221 +3638,233 @@ class _EventFormDialogState extends State<EventFormDialog> {
         width: min(MediaQuery.sizeOf(context).width - 48, 640),
         child: Form(
           key: _formKey,
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (isPlanMode) ...[
-                  TextFormField(
-                    controller: _titleController,
-                    decoration: const InputDecoration(
-                      labelText: 'Event title',
-                      prefixIcon: Icon(Icons.event_outlined),
+          child: AppScrollbar(
+            builder: (controller) => SingleChildScrollView(
+              controller: controller,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (isPlanMode) ...[
+                    TextFormField(
+                      controller: _titleController,
+                      decoration: const InputDecoration(
+                        labelText: 'Event title',
+                        prefixIcon: Icon(Icons.event_outlined),
+                      ),
+                      textInputAction: TextInputAction.next,
+                      validator: _requiredValidator,
                     ),
-                    textInputAction: TextInputAction.next,
-                    validator: _requiredValidator,
-                  ),
-                  const SizedBox(height: 12),
-                  TextFormField(
-                    controller: _locationController,
-                    decoration: const InputDecoration(
-                      labelText: 'Location',
-                      prefixIcon: Icon(Icons.place_outlined),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: _locationController,
+                      decoration: const InputDecoration(
+                        labelText: 'Location',
+                        prefixIcon: Icon(Icons.place_outlined),
+                      ),
+                      textInputAction: TextInputAction.next,
                     ),
-                    textInputAction: TextInputAction.next,
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: DatePickButton(
+                    const SizedBox(height: 12),
+                    ResponsiveFieldRow(
+                      children: [
+                        DatePickButton(
                           label: 'Date',
                           value: _date,
                           onTap: _pickDate,
                         ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: OutlinedButton.icon(
+                        OutlinedButton.icon(
                           onPressed: _pickTime,
                           icon: const Icon(Icons.schedule),
                           label: Text('From ${_time.format(context)}'),
                         ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _isFlexible ? null : _pickEndTime,
-                          icon: const Icon(Icons.timer_outlined),
-                          label: Text(
-                            _isFlexible
-                                ? 'End flexible'
-                                : 'To ${_endTime.format(context)}',
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: _isFlexible ? null : _pickEndTime,
+                            icon: const Icon(Icons.timer_outlined),
+                            label: Text(
+                              _isFlexible
+                                  ? 'End flexible'
+                                  : 'To ${_endTime.format(context)}',
+                            ),
                           ),
                         ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    CheckboxListTile(
+                      value: _isFlexible,
+                      onChanged: (value) {
+                        setState(() => _isFlexible = value ?? false);
+                      },
+                      title: const Text('Flexible timing'),
+                      subtitle: const Text(
+                        'End time is disabled when flexible',
                       ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  CheckboxListTile(
-                    value: _isFlexible,
-                    onChanged: (value) {
-                      setState(() => _isFlexible = value ?? false);
-                    },
-                    title: const Text('Flexible timing'),
-                    subtitle: const Text('End time is disabled when flexible'),
-                    controlAffinity: ListTileControlAffinity.leading,
-                  ),
-                  const SizedBox(height: 12),
-                  TextFormField(
-                    controller: _planController,
-                    decoration: const InputDecoration(
-                      labelText: 'Plan',
-                      prefixIcon: Icon(Icons.subject_outlined),
+                      controlAffinity: ListTileControlAffinity.leading,
                     ),
-                    minLines: 3,
-                    maxLines: 5,
-                  ),
-                ],
-                if (isExperienceMode) ...[
-                  TextFormField(
-                    controller: _journalController,
-                    decoration: const InputDecoration(
-                      labelText: 'Experience',
-                      prefixIcon: Icon(Icons.edit_note_outlined),
-                    ),
-                    minLines: 4,
-                    maxLines: 7,
-                  ),
-                  const SizedBox(height: 12),
-                  TextFormField(
-                    controller: _feelingController,
-                    decoration: const InputDecoration(
-                      labelText: 'Feeling',
-                      prefixIcon: Icon(Icons.favorite_border),
-                    ),
-                    textInputAction: TextInputAction.next,
-                  ),
-                ],
-                if (isExpenseMode) ...[
-                  SegmentedButton<ExpenseInputMode>(
-                    segments: const [
-                      ButtonSegment(
-                        value: ExpenseInputMode.total,
-                        icon: Icon(Icons.payments_outlined),
-                        label: Text('Total'),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: _planController,
+                      decoration: const InputDecoration(
+                        labelText: 'Plan',
+                        prefixIcon: Icon(Icons.subject_outlined),
                       ),
-                      ButtonSegment(
-                        value: ExpenseInputMode.perPerson,
-                        icon: Icon(Icons.person_outline),
-                        label: Text('Per pax'),
-                      ),
-                    ],
-                    selected: {_expenseInputMode},
-                    onSelectionChanged: (value) {
-                      setState(() => _expenseInputMode = value.first);
-                    },
-                  ),
-                  const SizedBox(height: 12),
-                  DropdownButtonFormField<String>(
-                    initialValue: _selectedExpenseCurrency,
-                    decoration: const InputDecoration(
-                      labelText: 'Expense currency',
-                      prefixIcon: Icon(Icons.payments_outlined),
+                      minLines: 3,
+                      maxLines: 5,
                     ),
-                    items: [
-                      for (final currency in _supportedCurrencies)
-                        DropdownMenuItem(
-                          value: currency.code,
-                          child: Text(currency.label),
+                  ],
+                  if (isExperienceMode) ...[
+                    TextFormField(
+                      controller: _journalController,
+                      decoration: const InputDecoration(
+                        labelText: 'Experience',
+                        prefixIcon: Icon(Icons.edit_note_outlined),
+                      ),
+                      minLines: 4,
+                      maxLines: 7,
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: _feelingController,
+                      decoration: const InputDecoration(
+                        labelText: 'Feeling',
+                        prefixIcon: Icon(Icons.favorite_border),
+                      ),
+                      textInputAction: TextInputAction.next,
+                    ),
+                  ],
+                  if (isExpenseMode) ...[
+                    SegmentedButton<ExpenseInputMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: ExpenseInputMode.total,
+                          icon: Icon(Icons.payments_outlined),
+                          label: Text('Total'),
                         ),
+                        ButtonSegment(
+                          value: ExpenseInputMode.perPerson,
+                          icon: Icon(Icons.person_outline),
+                          label: Text('Per pax'),
+                        ),
+                      ],
+                      selected: {_expenseInputMode},
+                      onSelectionChanged: (value) {
+                        setState(() => _expenseInputMode = value.first);
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                      initialValue: _selectedExpenseCurrency,
+                      decoration: const InputDecoration(
+                        labelText: 'Expense currency',
+                        prefixIcon: Icon(Icons.payments_outlined),
+                      ),
+                      items: [
+                        for (final currency in _supportedCurrencies)
+                          DropdownMenuItem(
+                            value: currency.code,
+                            child: Text(currency.label),
+                          ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          setState(() => _selectedExpenseCurrency = value);
+                        }
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: _expenseController,
+                      decoration: InputDecoration(
+                        labelText:
+                            '${_expenseInputMode == ExpenseInputMode.total ? 'Total' : 'Per pax'} $_selectedExpenseCurrency',
+                        prefixIcon: const Icon(Icons.receipt_long_outlined),
+                      ),
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      validator: _optionalPositiveNumberValidator,
+                    ),
+                    const SizedBox(height: 12),
+                    InputDecorator(
+                      decoration: InputDecoration(
+                        labelText:
+                            'Converted ${_expenseInputMode == ExpenseInputMode.perPerson ? 'per pax' : 'total'}',
+                        prefixIcon: const Icon(Icons.currency_exchange),
+                        border: const OutlineInputBorder(),
+                      ),
+                      child: Text(_convertedExpensePreview()),
+                    ),
+                    const SizedBox(height: 12),
+                    if (widget.trip.members.isNotEmpty) ...[
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          'Split with',
+                          style: Theme.of(context).textTheme.labelLarge,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            for (final member in widget.trip.members)
+                              FilterChip(
+                                label: Text(member.name),
+                                selected: _selectedExpenseMemberIds.contains(
+                                  member.id,
+                                ),
+                                onSelected: (selected) {
+                                  setState(() {
+                                    if (selected) {
+                                      _selectedExpenseMemberIds.add(member.id);
+                                    } else {
+                                      _selectedExpenseMemberIds.remove(
+                                        member.id,
+                                      );
+                                    }
+                                    _splitController.text = max(
+                                      1,
+                                      _selectedExpenseMemberIds.length,
+                                    ).toString();
+                                  });
+                                },
+                              ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 12),
                     ],
-                    onChanged: (value) {
-                      if (value != null) {
-                        setState(() => _selectedExpenseCurrency = value);
-                      }
-                    },
-                  ),
-                  const SizedBox(height: 12),
-                  TextFormField(
-                    controller: _expenseController,
-                    decoration: InputDecoration(
-                      labelText:
-                          '${_expenseInputMode == ExpenseInputMode.total ? 'Total' : 'Per pax'} $_selectedExpenseCurrency',
-                      prefixIcon: const Icon(Icons.receipt_long_outlined),
+                    TextFormField(
+                      controller: _splitController,
+                      decoration: const InputDecoration(
+                        labelText: 'Split count',
+                        prefixIcon: Icon(Icons.group_outlined),
+                      ),
+                      enabled: _selectedExpenseMemberIds.isEmpty,
+                      keyboardType: TextInputType.number,
+                      validator: _positiveIntegerValidator,
                     ),
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
-                    ),
-                    validator: _optionalPositiveNumberValidator,
-                  ),
-                  const SizedBox(height: 12),
-                  if (widget.trip.members.isNotEmpty) ...[
+                  ],
+                  if (!isPlanMode && widget.event != null) ...[
+                    const SizedBox(height: 12),
                     Align(
                       alignment: Alignment.centerLeft,
                       child: Text(
-                        'Split with',
-                        style: Theme.of(context).textTheme.labelLarge,
+                        widget.event!.title,
+                        style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ),
-                    const SizedBox(height: 8),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          for (final member in widget.trip.members)
-                            FilterChip(
-                              label: Text(member.name),
-                              selected: _selectedExpenseMemberIds.contains(
-                                member.id,
-                              ),
-                              onSelected: (selected) {
-                                setState(() {
-                                  if (selected) {
-                                    _selectedExpenseMemberIds.add(member.id);
-                                  } else {
-                                    _selectedExpenseMemberIds.remove(member.id);
-                                  }
-                                  _splitController.text = max(
-                                    1,
-                                    _selectedExpenseMemberIds.length,
-                                  ).toString();
-                                });
-                              },
-                            ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 12),
                   ],
-                  TextFormField(
-                    controller: _splitController,
-                    decoration: const InputDecoration(
-                      labelText: 'Split count',
-                      prefixIcon: Icon(Icons.group_outlined),
-                    ),
-                    enabled: _selectedExpenseMemberIds.isEmpty,
-                    keyboardType: TextInputType.number,
-                    validator: _positiveIntegerValidator,
-                  ),
                 ],
-                if (!isPlanMode && widget.event != null) ...[
-                  const SizedBox(height: 12),
-                  Align(
-                    alignment: Alignment.centerLeft,
-                    child: Text(
-                      widget.event!.title,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                  ),
-                ],
-              ],
+              ),
             ),
           ),
         ),
