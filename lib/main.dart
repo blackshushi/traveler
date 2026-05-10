@@ -65,6 +65,13 @@ enum ExpenseInputMode { total, perPerson }
 
 enum AttachmentKind { file, photo }
 
+class EventDayGroup {
+  EventDayGroup({required this.date, required this.events});
+
+  final DateTime date;
+  final List<TravelEvent> events;
+}
+
 String _newId(String prefix) {
   final timestamp = DateTime.now().microsecondsSinceEpoch;
   final suffix = _idRandom.nextInt(999999).toString().padLeft(6, '0');
@@ -225,6 +232,28 @@ List<TravelTrip> _sortTripsByTime(List<TravelTrip> trips) {
   });
 
   return sorted;
+}
+
+DateTime _dateOnly(DateTime value) {
+  return DateTime(value.year, value.month, value.day);
+}
+
+String _dayKey(DateTime value) {
+  return _dateOnly(value).toIso8601String();
+}
+
+List<EventDayGroup> _groupEventsByDay(List<TravelEvent> events) {
+  final groups = <EventDayGroup>[];
+  for (final event in events) {
+    final day = _dateOnly(event.startAt);
+    if (groups.isEmpty || !DateUtils.isSameDay(groups.last.date, day)) {
+      groups.add(EventDayGroup(date: day, events: [event]));
+    } else {
+      groups.last.events.add(event);
+    }
+  }
+
+  return groups;
 }
 
 String _shareDivider([int length = 42]) {
@@ -1537,7 +1566,7 @@ class TripMetaChip extends StatelessWidget {
   }
 }
 
-class PlanTab extends StatelessWidget {
+class PlanTab extends StatefulWidget {
   const PlanTab({
     super.key,
     required this.trip,
@@ -1556,35 +1585,65 @@ class PlanTab extends StatelessWidget {
   final ValueChanged<TravelEvent> onRenameEvent;
 
   @override
-  Widget build(BuildContext context) {
-    final events = trip.sortedEvents;
-    final children = <Widget>[];
-    DateTime? currentDay;
+  State<PlanTab> createState() => _PlanTabState();
+}
 
-    for (var index = 0; index < events.length; index++) {
-      final event = events[index];
-      final day = DateTime(
-        event.startAt.year,
-        event.startAt.month,
-        event.startAt.day,
-      );
-      if (currentDay == null || !DateUtils.isSameDay(currentDay, day)) {
-        children.add(DaySeparator(date: day));
-        currentDay = day;
+class _PlanTabState extends State<PlanTab> {
+  final _collapsedDays = <String>{};
+
+  @override
+  void didUpdateWidget(covariant PlanTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.trip.id != widget.trip.id) {
+      _collapsedDays.clear();
+    }
+  }
+
+  void _toggleDay(DateTime date) {
+    final key = _dayKey(date);
+    setState(() {
+      if (!_collapsedDays.add(key)) {
+        _collapsedDays.remove(key);
       }
+    });
+  }
 
+  @override
+  Widget build(BuildContext context) {
+    final events = widget.trip.sortedEvents;
+    final groups = _groupEventsByDay(events);
+    final children = <Widget>[];
+
+    for (final group in groups) {
+      final collapsed = _collapsedDays.contains(_dayKey(group.date));
       children.add(
-        TimelineEventCard(
-          trip: trip,
-          event: event,
-          isFirst: index == 0,
-          isLast: index == events.length - 1,
-          onOpenActions: () => onOpenEventActions(event),
-          onEdit: () => onEditEvent(event),
-          onDelete: () => onDeleteEvent(event),
-          onRename: () => onRenameEvent(event),
+        DaySeparator(
+          date: group.date,
+          collapsed: collapsed,
+          count: group.events.length,
+          onTap: () => _toggleDay(group.date),
         ),
       );
+
+      if (collapsed) {
+        continue;
+      }
+
+      for (var index = 0; index < group.events.length; index++) {
+        final event = group.events[index];
+        children.add(
+          TimelineEventCard(
+            trip: widget.trip,
+            event: event,
+            isFirst: index == 0,
+            isLast: index == group.events.length - 1,
+            onOpenActions: () => widget.onOpenEventActions(event),
+            onEdit: () => widget.onEditEvent(event),
+            onDelete: () => widget.onDeleteEvent(event),
+            onRename: () => widget.onRenameEvent(event),
+          ),
+        );
+      }
     }
 
     return Stack(
@@ -1594,7 +1653,7 @@ class PlanTab extends StatelessWidget {
             icon: Icons.route_outlined,
             title: 'No plan yet',
             actionLabel: 'Add event',
-            onAction: onAddEvent,
+            onAction: widget.onAddEvent,
           )
         else
           AppScrollbar(
@@ -1608,7 +1667,7 @@ class PlanTab extends StatelessWidget {
           right: 16,
           bottom: 16,
           child: FloatingActionButton.extended(
-            onPressed: onAddEvent,
+            onPressed: widget.onAddEvent,
             icon: const Icon(Icons.add),
             label: const Text('Event'),
           ),
@@ -1619,9 +1678,18 @@ class PlanTab extends StatelessWidget {
 }
 
 class DaySeparator extends StatelessWidget {
-  const DaySeparator({super.key, required this.date});
+  const DaySeparator({
+    super.key,
+    required this.date,
+    this.collapsed = false,
+    this.count,
+    this.onTap,
+  });
 
   final DateTime date;
+  final bool collapsed;
+  final int? count;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -1631,13 +1699,37 @@ class DaySeparator extends StatelessWidget {
       child: Row(
         children: [
           const Expanded(child: Divider()),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Text(
-              _dayFormatter.format(date),
-              style: theme.textTheme.labelLarge?.copyWith(
-                fontWeight: FontWeight.w700,
-                color: theme.colorScheme.primary,
+          InkWell(
+            borderRadius: BorderRadius.circular(999),
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    collapsed ? Icons.expand_more : Icons.expand_less,
+                    size: 18,
+                    color: theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _dayFormatter.format(date),
+                    style: theme.textTheme.labelLarge?.copyWith(
+                      fontWeight: FontWeight.w700,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
+                  if (count != null) ...[
+                    const SizedBox(width: 6),
+                    Text(
+                      '$count',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ),
           ),
@@ -1966,7 +2058,7 @@ class ActionTile extends StatelessWidget {
   }
 }
 
-class JournalTab extends StatelessWidget {
+class JournalTab extends StatefulWidget {
   const JournalTab({
     super.key,
     required this.trip,
@@ -1977,8 +2069,40 @@ class JournalTab extends StatelessWidget {
   final ValueChanged<TravelEvent> onOpenEventActions;
 
   @override
+  State<JournalTab> createState() => _JournalTabState();
+}
+
+class _JournalTabState extends State<JournalTab> {
+  final _collapsedDays = <String>{};
+
+  @override
+  void didUpdateWidget(covariant JournalTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.trip.id != widget.trip.id) {
+      _collapsedDays.clear();
+    }
+  }
+
+  void _toggleDay(DateTime date) {
+    final key = _dayKey(date);
+    setState(() {
+      if (!_collapsedDays.add(key)) {
+        _collapsedDays.remove(key);
+      }
+    });
+  }
+
+  void _openExpenseDetails() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => ExpenseDetailsPage(trip: widget.trip),
+      ),
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final events = trip.sortedEvents;
+    final events = widget.trip.sortedEvents;
 
     if (events.isEmpty) {
       return const EmptyTabView(
@@ -1996,14 +2120,23 @@ class JournalTab extends StatelessWidget {
           keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
           padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
           children: [
-            ExpenseSummaryCard(trip: trip),
+            ExpenseSummaryCard(trip: widget.trip, onTap: _openExpenseDetails),
             const SizedBox(height: 12),
-            for (final event in events)
-              JournalEventCard(
-                trip: trip,
-                event: event,
-                onTap: () => onOpenEventActions(event),
+            for (final group in _groupEventsByDay(events)) ...[
+              DaySeparator(
+                date: group.date,
+                collapsed: _collapsedDays.contains(_dayKey(group.date)),
+                count: group.events.length,
+                onTap: () => _toggleDay(group.date),
               ),
+              if (!_collapsedDays.contains(_dayKey(group.date)))
+                for (final event in group.events)
+                  JournalEventCard(
+                    trip: widget.trip,
+                    event: event,
+                    onTap: () => widget.onOpenEventActions(event),
+                  ),
+            ],
           ],
         ),
       ),
@@ -2012,9 +2145,14 @@ class JournalTab extends StatelessWidget {
 }
 
 class ExpenseSummaryCard extends StatelessWidget {
-  const ExpenseSummaryCard({super.key, required this.trip});
+  const ExpenseSummaryCard({
+    super.key,
+    required this.trip,
+    required this.onTap,
+  });
 
   final TravelTrip trip;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -2023,45 +2161,301 @@ class ExpenseSummaryCard extends StatelessWidget {
 
     return Card(
       color: const Color(0xFFFFF4E8),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Wrap(
-          spacing: 12,
-          runSpacing: 10,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          alignment: WrapAlignment.spaceBetween,
-          children: [
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.account_balance_wallet_outlined),
-                const SizedBox(width: 12),
-                Flexible(
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Wrap(
+            spacing: 12,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            alignment: WrapAlignment.spaceBetween,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.account_balance_wallet_outlined),
+                  const SizedBox(width: 12),
+                  Flexible(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Expenses',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          _formatMoney(trip.targetCurrency, totalTarget),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.headlineSmall
+                              ?.copyWith(fontWeight: FontWeight.w800),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  const Icon(Icons.chevron_right),
+                ],
+              ),
+              Text(
+                'MYR ${_moneyFormatter.format(totalMyr)}',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ExpenseDetailsPage extends StatefulWidget {
+  const ExpenseDetailsPage({super.key, required this.trip});
+
+  final TravelTrip trip;
+
+  @override
+  State<ExpenseDetailsPage> createState() => _ExpenseDetailsPageState();
+}
+
+class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
+  String? _selectedMemberId;
+
+  TravelMember? get _selectedMember {
+    final selectedId = _selectedMemberId;
+    if (selectedId == null) {
+      return null;
+    }
+
+    for (final member in widget.trip.members) {
+      if (member.id == selectedId) {
+        return member;
+      }
+    }
+
+    return null;
+  }
+
+  List<TravelEvent> get _expenseEvents {
+    final selectedId = _selectedMemberId;
+    return [
+      for (final event in widget.trip.sortedEvents)
+        if (event.expenseAmount > 0 &&
+            (selectedId == null || event.expenseMemberIds.contains(selectedId)))
+          event,
+    ];
+  }
+
+  double _eventMyrAmount(TravelEvent event) {
+    final fullAmount = _expenseAmountInMyr(widget.trip, event);
+    return _selectedMemberId == null
+        ? fullAmount
+        : fullAmount / max(1, event.splitCount);
+  }
+
+  double _eventTripAmount(TravelEvent event) {
+    final targetRate = max(widget.trip.exchangeRateToMyr, 0.000001);
+    return _eventMyrAmount(event) / targetRate;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final selectedMember = _selectedMember;
+    final events = _expenseEvents;
+    final totalMyr = events.fold<double>(
+      0,
+      (total, event) => total + _eventMyrAmount(event),
+    );
+    final totalTrip = events.fold<double>(
+      0,
+      (total, event) => total + _eventTripAmount(event),
+    );
+    final colors = Theme.of(context).colorScheme;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Expenses')),
+      body: SafeArea(
+        child: AppScrollbar(
+          builder: (controller) => ListView(
+            controller: controller,
+            padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
+            children: [
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  ChoiceChip(
+                    label: const Text('All'),
+                    selected: _selectedMemberId == null,
+                    onSelected: (_) => setState(() => _selectedMemberId = null),
+                  ),
+                  for (final member in widget.trip.members)
+                    ChoiceChip(
+                      avatar: const Icon(Icons.person_outline, size: 18),
+                      label: Text(member.name),
+                      selected: _selectedMemberId == member.id,
+                      onSelected: (_) =>
+                          setState(() => _selectedMemberId = member.id),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Card(
+                color: const Color(0xFFFFF4E8),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Expenses',
+                        selectedMember == null
+                            ? 'All expenses'
+                            : '${selectedMember.name} total',
                         style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _formatMoney(widget.trip.targetCurrency, totalTrip),
+                        style: Theme.of(context).textTheme.headlineSmall
+                            ?.copyWith(fontWeight: FontWeight.w800),
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        _formatMoney(trip.targetCurrency, totalTarget),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.headlineSmall
-                            ?.copyWith(fontWeight: FontWeight.w800),
+                        'MYR ${_moneyFormatter.format(totalMyr)}',
+                        style: Theme.of(context).textTheme.bodyMedium,
                       ),
                     ],
                   ),
                 ),
-              ],
-            ),
-            Text(
-              'MYR ${_moneyFormatter.format(totalMyr)}',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-          ],
+              ),
+              const SizedBox(height: 12),
+              if (events.isEmpty)
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text(
+                      selectedMember == null
+                          ? 'No expenses yet'
+                          : 'No expenses tagged to ${selectedMember.name}',
+                    ),
+                  ),
+                )
+              else
+                for (final event in events) ...[
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      event.title,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .titleMedium
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      '${_dayFormatter.format(event.startAt)} - ${event.timeRangeLabel}',
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: colors.onSurfaceVariant,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Column(
+                                crossAxisAlignment: CrossAxisAlignment.end,
+                                children: [
+                                  Text(
+                                    _formatMoney(
+                                      widget.trip.targetCurrency,
+                                      _eventTripAmount(event),
+                                    ),
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleMedium
+                                        ?.copyWith(fontWeight: FontWeight.w800),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    'MYR ${_moneyFormatter.format(_eventMyrAmount(event))}',
+                                    style: Theme.of(
+                                      context,
+                                    ).textTheme.bodySmall,
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              Chip(
+                                avatar: const Icon(
+                                  Icons.receipt_long_outlined,
+                                  size: 18,
+                                ),
+                                label: Text(
+                                  _formatMoney(
+                                    event.expenseCurrencyCode,
+                                    event.expenseAmount,
+                                  ),
+                                ),
+                                visualDensity: VisualDensity.compact,
+                              ),
+                              if (event.splitCount > 1)
+                                Chip(
+                                  avatar: const Icon(
+                                    Icons.group_outlined,
+                                    size: 18,
+                                  ),
+                                  label: Text('${event.splitCount} ways'),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              for (final label in _memberTagLabelsForIds(
+                                widget.trip,
+                                event.expenseMemberIds,
+                              ))
+                                Chip(
+                                  avatar: Icon(
+                                    label == 'All'
+                                        ? Icons.groups_outlined
+                                        : Icons.person_outline,
+                                    size: 18,
+                                  ),
+                                  label: Text(label),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+            ],
+          ),
         ),
       ),
     );
@@ -2726,56 +3120,29 @@ class _AttachmentCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final attachment = item.attachment;
 
-    return Card(
-      child: ListTile(
-        leading: AttachmentThumbnail(attachment: attachment, size: 56),
-        title: Text(
-          attachment.name,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-        ),
-        subtitle: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              [
-                item.event?.title ?? 'Trip file',
-                _formatBytes(attachment.sizeBytes),
-                _shortDayFormatter.format(attachment.addedAt),
-              ].join(' - '),
-            ),
-            MemberTagWrap(trip: trip, memberIds: attachment.memberIds),
-          ],
-        ),
-        onTap: () => onOpenAttachment(attachment),
-        trailing: SizedBox(
-          width: 96,
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.end,
-            children: [
-              IconButton(
-                tooltip: 'Pin members',
-                onPressed: () => onEditPinnedMembers(item),
-                icon: const Icon(Icons.person_pin_outlined),
-              ),
-              IconButton(
-                tooltip: 'Remove file',
-                onPressed: () => onRemoveAttachment(item.event, attachment),
-                icon: const Icon(Icons.delete_outline),
-              ),
-            ],
-          ),
-        ),
-      ),
+    return AttachmentFileCard(
+      trip: trip,
+      attachment: attachment,
+      subtitle: [
+        item.event?.title ?? 'Trip file',
+        _formatBytes(attachment.sizeBytes),
+        _shortDayFormatter.format(attachment.addedAt),
+      ].join(' - '),
+      onOpen: () => onOpenAttachment(attachment),
+      onEditPinnedMembers: () => onEditPinnedMembers(item),
+      onRemove: () {
+        onRemoveAttachment(item.event, attachment);
+      },
     );
   }
 }
 
-class AttachmentListTile extends StatelessWidget {
-  const AttachmentListTile({
+class AttachmentFileCard extends StatelessWidget {
+  const AttachmentFileCard({
     super.key,
     required this.trip,
     required this.attachment,
+    required this.subtitle,
     required this.onOpen,
     required this.onEditPinnedMembers,
     required this.onRemove,
@@ -2783,43 +3150,60 @@ class AttachmentListTile extends StatelessWidget {
 
   final TravelTrip trip;
   final TravelAttachment attachment;
+  final String subtitle;
   final VoidCallback onOpen;
   final VoidCallback onEditPinnedMembers;
   final VoidCallback onRemove;
 
   @override
   Widget build(BuildContext context) {
-    return ListTile(
-      leading: AttachmentThumbnail(attachment: attachment, size: 48),
-      title: Text(
-        attachment.name,
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-      ),
-      subtitle: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            '${_attachmentKindName(attachment.kind)} - ${_formatBytes(attachment.sizeBytes)}',
-          ),
-          MemberTagWrap(trip: trip, memberIds: attachment.memberIds),
-        ],
-      ),
-      onTap: onOpen,
-      trailing: SizedBox(
-        width: 96,
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.end,
+    final colors = Theme.of(context).colorScheme;
+
+    return Card(
+      child: InkWell(
+        onTap: onOpen,
+        borderRadius: BorderRadius.circular(8),
+        child: Stack(
           children: [
-            IconButton(
-              tooltip: 'Pin members',
-              onPressed: onEditPinnedMembers,
-              icon: const Icon(Icons.person_pin_outlined),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 12, 44, 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    attachment.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    subtitle,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: colors.onSurfaceVariant,
+                    ),
+                  ),
+                  MemberTagWrap(
+                    trip: trip,
+                    memberIds: attachment.memberIds,
+                    onAdd: onEditPinnedMembers,
+                  ),
+                ],
+              ),
             ),
-            IconButton(
-              tooltip: 'Remove',
-              onPressed: onRemove,
-              icon: const Icon(Icons.delete_outline),
+            Positioned(
+              right: 4,
+              top: 4,
+              child: IconButton(
+                tooltip: 'Remove',
+                visualDensity: VisualDensity.compact,
+                onPressed: onRemove,
+                icon: const Icon(Icons.close, size: 18),
+              ),
             ),
           ],
         ),
@@ -2846,60 +3230,59 @@ class PhotoAttachmentCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
     return Card(
       clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onOpen,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Expanded(
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: InkWell(
+              onTap: onOpen,
               child: AttachmentThumbnail(
                 attachment: attachment,
                 size: double.infinity,
                 borderRadius: BorderRadius.zero,
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 8, 6, 4),
-              child: Text(
-                attachment.name,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.labelLarge,
+          ),
+          Positioned(
+            right: 6,
+            top: 6,
+            child: Material(
+              color: Theme.of(
+                context,
+              ).colorScheme.surface.withValues(alpha: 0.92),
+              shape: const CircleBorder(),
+              child: IconButton(
+                tooltip: 'Remove',
+                visualDensity: VisualDensity.compact,
+                onPressed: onRemove,
+                icon: const Icon(Icons.close, size: 18),
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(8, 0, 4, 6),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      _formatBytes(attachment.sizeBytes),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodySmall,
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: 'Pin members',
-                    visualDensity: VisualDensity.compact,
-                    onPressed: onEditPinnedMembers,
-                    icon: const Icon(Icons.person_pin_outlined, size: 20),
-                  ),
-                  IconButton(
-                    tooltip: 'Remove',
-                    visualDensity: VisualDensity.compact,
-                    onPressed: onRemove,
-                    icon: const Icon(Icons.delete_outline, size: 20),
-                  ),
-                ],
+          ),
+          Positioned(
+            left: 8,
+            right: 8,
+            bottom: 8,
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: Theme.of(
+                  context,
+                ).colorScheme.surface.withValues(alpha: 0.92),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(8, 2, 8, 6),
+                child: MemberTagWrap(
+                  trip: trip,
+                  memberIds: attachment.memberIds,
+                  onAdd: onEditPinnedMembers,
+                  compact: true,
+                ),
               ),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -3066,15 +3449,23 @@ class _AttachmentMembersDialogState extends State<AttachmentMembersDialog> {
 }
 
 class MemberTagWrap extends StatelessWidget {
-  const MemberTagWrap({super.key, required this.trip, required this.memberIds});
+  const MemberTagWrap({
+    super.key,
+    required this.trip,
+    required this.memberIds,
+    this.onAdd,
+    this.compact = false,
+  });
 
   final TravelTrip trip;
   final Iterable<String> memberIds;
+  final VoidCallback? onAdd;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
     final labels = _memberTagLabelsForIds(trip, memberIds);
-    if (labels.isEmpty) {
+    if (labels.isEmpty && onAdd == null) {
       return const SizedBox.shrink();
     }
 
@@ -3084,6 +3475,13 @@ class MemberTagWrap extends StatelessWidget {
         spacing: 6,
         runSpacing: 4,
         children: [
+          if (onAdd != null)
+            ActionChip(
+              avatar: const Icon(Icons.add, size: 16),
+              label: Text(compact ? 'Tag' : 'Add tag'),
+              visualDensity: VisualDensity.compact,
+              onPressed: onAdd,
+            ),
           for (final label in labels)
             Chip(
               avatar: Icon(
@@ -3092,6 +3490,7 @@ class MemberTagWrap extends StatelessWidget {
               ),
               label: Text(label),
               visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
             ),
         ],
       ),
@@ -3289,14 +3688,18 @@ class _EventFilesDialogState extends State<EventFilesDialog>
                                 const Divider(height: 1),
                             itemBuilder: (context, index) {
                               final attachment = _files[index];
-                              return AttachmentListTile(
+                              return AttachmentFileCard(
                                 trip: widget.trip,
                                 attachment: attachment,
+                                subtitle:
+                                    'File - ${_formatBytes(attachment.sizeBytes)}',
                                 onOpen: () =>
                                     widget.onOpenAttachment(attachment),
                                 onEditPinnedMembers: () =>
                                     _editPinnedMembers(context, attachment),
-                                onRemove: () => _removeAttachment(attachment),
+                                onRemove: () {
+                                  _removeAttachment(attachment);
+                                },
                               );
                             },
                           ),
@@ -3308,10 +3711,10 @@ class _EventFilesDialogState extends State<EventFilesDialog>
                             controller: controller,
                             gridDelegate:
                                 const SliverGridDelegateWithMaxCrossAxisExtent(
-                                  maxCrossAxisExtent: 180,
-                                  mainAxisSpacing: 10,
-                                  crossAxisSpacing: 10,
-                                  childAspectRatio: 0.78,
+                                  maxCrossAxisExtent: 240,
+                                  mainAxisSpacing: 12,
+                                  crossAxisSpacing: 12,
+                                  childAspectRatio: 1,
                                 ),
                             itemCount: _photos.length,
                             itemBuilder: (context, index) {
@@ -3323,7 +3726,9 @@ class _EventFilesDialogState extends State<EventFilesDialog>
                                     widget.onOpenAttachment(attachment),
                                 onEditPinnedMembers: () =>
                                     _editPinnedMembers(context, attachment),
-                                onRemove: () => _removeAttachment(attachment),
+                                onRemove: () {
+                                  _removeAttachment(attachment);
+                                },
                               );
                             },
                           ),

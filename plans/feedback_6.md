@@ -1,0 +1,4 @@
+1. Add feature: In Journal expenses, make it clickable and make it a new page. showing out the details of expenses and also selectable for user. clicking user tag should show the total and list down the detail expenses.
+2. In photos, enhance the design - for user tag, add a + tag to add instead of current tag, remove the dumb bin icon, make it a small x button on top right instead. make the image bigger, so user can view it easily, name no need to show.
+3. In files, left side icon is no needed. user tag is blocked. make sure the design is flexible enough to show. same, use the + tag and x button mentioned in 2.
+4. Make Journal and plan collapsable for date. make the date clickable, and toggle on and off for showing the plans
