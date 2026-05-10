@@ -45,7 +45,7 @@ const _supportedCurrencies = [
 ];
 
 typedef AttachmentAction =
-    Future<void> Function(TravelEvent? event, TravelAttachment attachment);
+    Future<bool> Function(TravelEvent? event, TravelAttachment attachment);
 
 typedef AttachmentPickAction =
     Future<TravelAttachment?> Function(TravelEvent? event);
@@ -161,6 +161,32 @@ String _attachmentKindName(AttachmentKind kind) {
     AttachmentKind.file => 'File',
     AttachmentKind.photo => 'Photo',
   };
+}
+
+int _attachmentKindCount(
+  Iterable<TravelAttachment> attachments,
+  AttachmentKind kind,
+) {
+  return attachments.where((attachment) => attachment.kind == kind).length;
+}
+
+String _attachmentCountLabel(int count, AttachmentKind kind) {
+  final label = switch (kind) {
+    AttachmentKind.file => count == 1 ? 'file' : 'files',
+    AttachmentKind.photo => count == 1 ? 'photo' : 'photos',
+  };
+  return '$count $label';
+}
+
+String _attachmentSummaryLabel(Iterable<TravelAttachment> attachments) {
+  final files = _attachmentKindCount(attachments, AttachmentKind.file);
+  final photos = _attachmentKindCount(attachments, AttachmentKind.photo);
+  final parts = [
+    if (files > 0) _attachmentCountLabel(files, AttachmentKind.file),
+    if (photos > 0) _attachmentCountLabel(photos, AttachmentKind.photo),
+  ];
+
+  return parts.isEmpty ? 'No files or photos' : parts.join(' - ');
 }
 
 Uint8List? _attachmentBytes(TravelAttachment attachment) {
@@ -860,11 +886,41 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     }
   }
 
-  Future<void> _removeAttachment(
+  Future<bool> _confirmRemoveAttachment(TravelAttachment attachment) async {
+    final kind = _attachmentKindName(attachment.kind).toLowerCase();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Delete $kind'),
+        content: Text(
+          'Remove ${attachment.name} from this trip? The original file on your device will not be deleted.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    return confirmed == true;
+  }
+
+  Future<bool> _removeAttachment(
     TravelTrip trip,
     TravelAttachment attachment,
     TravelEvent? event,
   ) async {
+    final confirmed = await _confirmRemoveAttachment(attachment);
+    if (!confirmed || !mounted) {
+      return false;
+    }
+
     if (event != null) {
       await _updateCurrentTrip(trip, (currentTrip) {
         return currentTrip.copyWith(
@@ -881,7 +937,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
           }).toList(),
         );
       });
-      return;
+      return true;
     }
 
     await _updateCurrentTrip(
@@ -892,6 +948,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
             .toList(),
       ),
     );
+    return true;
   }
 
   Future<void> _updateAttachmentMembers(
@@ -1446,12 +1503,7 @@ class _TripDetailViewState extends State<TripDetailView>
   }
 
   void _handleHeaderTap() {
-    if (_headerExpanded) {
-      widget.onEditTrip();
-      return;
-    }
-
-    setState(() => _headerExpanded = true);
+    setState(() => _headerExpanded = !_headerExpanded);
   }
 
   @override
@@ -1463,6 +1515,7 @@ class _TripDetailViewState extends State<TripDetailView>
           trip: widget.trip,
           expanded: _headerExpanded,
           onTitleTap: _handleHeaderTap,
+          onEdit: widget.onEditTrip,
           onManageMembers: widget.onManageMembers,
           onDelete: widget.onDeleteTrip,
           onShare: widget.onShareTrip,
@@ -1519,6 +1572,7 @@ class TripHeader extends StatelessWidget {
     required this.trip,
     required this.expanded,
     required this.onTitleTap,
+    required this.onEdit,
     required this.onManageMembers,
     required this.onDelete,
     required this.onShare,
@@ -1527,6 +1581,7 @@ class TripHeader extends StatelessWidget {
   final TravelTrip trip;
   final bool expanded;
   final VoidCallback onTitleTap;
+  final VoidCallback onEdit;
   final VoidCallback onManageMembers;
   final VoidCallback onDelete;
   final VoidCallback onShare;
@@ -1544,47 +1599,66 @@ class TripHeader extends StatelessWidget {
         children: [
           const SizedBox(width: 8),
           Expanded(
-            child: InkWell(
-              onTap: onTitleTap,
-              borderRadius: BorderRadius.circular(8),
-              child: Padding(
-                padding: const EdgeInsets.all(8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      trip.name,
-                      style: theme.textTheme.headlineSmall?.copyWith(
-                        fontWeight: FontWeight.w700,
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: InkWell(
+                          onTap: onTitleTap,
+                          borderRadius: BorderRadius.circular(8),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 2),
+                            child: Text(
+                              trip.name,
+                              style: theme.textTheme.headlineSmall?.copyWith(
+                                fontWeight: FontWeight.w700,
+                              ),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ),
                       ),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    if (expanded) ...[
-                      const SizedBox(height: 6),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 6,
-                        children: [
-                          TripMetaChip(
-                            icon: Icons.place_outlined,
-                            label: trip.country.isEmpty
-                                ? 'No country'
-                                : trip.country,
-                          ),
-                          TripMetaChip(
-                            icon: Icons.calendar_today_outlined,
-                            label: range,
-                          ),
-                          TripMetaChip(
-                            icon: Icons.group_outlined,
-                            label: '${trip.members.length} members',
-                          ),
-                        ],
-                      ),
+                      if (expanded) ...[
+                        const SizedBox(width: 4),
+                        IconButton(
+                          tooltip: 'Edit trip',
+                          onPressed: onEdit,
+                          visualDensity: VisualDensity.compact,
+                          icon: const Icon(Icons.edit_outlined, size: 20),
+                        ),
+                      ],
                     ],
+                  ),
+                  if (expanded) ...[
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 6,
+                      children: [
+                        TripMetaChip(
+                          icon: Icons.place_outlined,
+                          label: trip.country.isEmpty
+                              ? 'No country'
+                              : trip.country,
+                        ),
+                        TripMetaChip(
+                          icon: Icons.calendar_today_outlined,
+                          label: range,
+                        ),
+                        TripMetaChip(
+                          icon: Icons.group_outlined,
+                          label: '${trip.members.length} members',
+                        ),
+                      ],
+                    ),
                   ],
-                ),
+                ],
               ),
             ),
           ),
@@ -1825,6 +1899,14 @@ class TimelineEventCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
+    final fileCount = _attachmentKindCount(
+      event.attachments,
+      AttachmentKind.file,
+    );
+    final photoCount = _attachmentKindCount(
+      event.attachments,
+      AttachmentKind.photo,
+    );
 
     return IntrinsicHeight(
       child: Row(
@@ -1994,14 +2076,31 @@ class TimelineEventCard extends StatelessWidget {
                                     label: Text(event.feeling),
                                     visualDensity: VisualDensity.compact,
                                   ),
-                                if (event.attachments.isNotEmpty)
+                                if (fileCount > 0)
                                   Chip(
                                     avatar: const Icon(
                                       Icons.attach_file,
                                       size: 18,
                                     ),
                                     label: Text(
-                                      '${event.attachments.length} files',
+                                      _attachmentCountLabel(
+                                        fileCount,
+                                        AttachmentKind.file,
+                                      ),
+                                    ),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                if (photoCount > 0)
+                                  Chip(
+                                    avatar: const Icon(
+                                      Icons.photo_library_outlined,
+                                      size: 18,
+                                    ),
+                                    label: Text(
+                                      _attachmentCountLabel(
+                                        photoCount,
+                                        AttachmentKind.photo,
+                                      ),
                                     ),
                                     visualDensity: VisualDensity.compact,
                                   ),
@@ -2030,6 +2129,7 @@ class EventActionsSheet extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final maxHeight = MediaQuery.sizeOf(context).height * 0.75;
+    final attachmentSummary = _attachmentSummaryLabel(event.attachments);
 
     return SafeArea(
       child: ConstrainedBox(
@@ -2071,7 +2171,7 @@ class EventActionsSheet extends StatelessWidget {
                 ActionTile(
                   icon: Icons.folder_open_outlined,
                   title: 'Files and photos',
-                  subtitle: 'View, add, or remove event files',
+                  subtitle: attachmentSummary,
                   onTap: () => Navigator.of(context).pop(EventAction.files),
                 ),
                 const Divider(),
@@ -2482,19 +2582,6 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                                 ),
                                 visualDensity: VisualDensity.compact,
                               ),
-                              if (event.splitCount > 1 &&
-                                  !_memberIdsIncludeEveryTripMember(
-                                    widget.trip,
-                                    event.expenseMemberIds,
-                                  ))
-                                Chip(
-                                  avatar: const Icon(
-                                    Icons.group_outlined,
-                                    size: 18,
-                                  ),
-                                  label: Text('${event.splitCount} ways'),
-                                  visualDensity: VisualDensity.compact,
-                                ),
                               for (final label in _memberTagLabelsForIds(
                                 widget.trip,
                                 event.expenseMemberIds,
@@ -3543,50 +3630,64 @@ class PhotoAttachmentCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       clipBehavior: Clip.antiAlias,
-      child: Column(
-        children: [
-          Expanded(
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  child: InkWell(
-                    onTap: onOpen,
-                    child: AttachmentThumbnail(
-                      attachment: attachment,
-                      size: double.infinity,
-                      borderRadius: BorderRadius.zero,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final shortestSide = min(constraints.maxWidth, constraints.maxHeight);
+          final baseSize = shortestSide.isFinite ? shortestSide : 200.0;
+          final buttonSize = (baseSize * 0.16).clamp(24.0, 32.0).toDouble();
+          final iconSize = (buttonSize * 0.52).clamp(13.0, 17.0).toDouble();
+
+          return Column(
+            children: [
+              Expanded(
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: InkWell(
+                        onTap: onOpen,
+                        child: AttachmentThumbnail(
+                          attachment: attachment,
+                          size: double.infinity,
+                          borderRadius: BorderRadius.zero,
+                        ),
+                      ),
                     ),
-                  ),
-                ),
-                Positioned(
-                  right: 6,
-                  top: 6,
-                  child: Material(
-                    color: Theme.of(
-                      context,
-                    ).colorScheme.surface.withValues(alpha: 0.92),
-                    shape: const CircleBorder(),
-                    child: IconButton(
-                      tooltip: 'Remove',
-                      visualDensity: VisualDensity.compact,
-                      onPressed: onRemove,
-                      icon: const Icon(Icons.close, size: 18),
+                    Positioned(
+                      right: 6,
+                      top: 6,
+                      child: SizedBox.square(
+                        dimension: buttonSize,
+                        child: Material(
+                          color: Theme.of(
+                            context,
+                          ).colorScheme.surface.withValues(alpha: 0.92),
+                          shape: const CircleBorder(),
+                          child: IconButton(
+                            tooltip: 'Remove',
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(),
+                            visualDensity: VisualDensity.compact,
+                            onPressed: onRemove,
+                            icon: Icon(Icons.close, size: iconSize),
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
+                  ],
                 ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
-            child: MemberTagWrap(
-              trip: trip,
-              memberIds: attachment.memberIds,
-              onAdd: onEditPinnedMembers,
-              compact: true,
-            ),
-          ),
-        ],
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+                child: MemberTagWrap(
+                  trip: trip,
+                  memberIds: attachment.memberIds,
+                  onAdd: onEditPinnedMembers,
+                  compact: true,
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -3854,7 +3955,7 @@ class EventFilesDialog extends StatefulWidget {
   final ValueChanged<TravelAttachment> onOpenAttachment;
   final Future<TravelAttachment?> Function() onAttachFile;
   final Future<TravelAttachment?> Function(ImageSource source) onPickPhoto;
-  final Future<void> Function(TravelAttachment attachment) onRemoveAttachment;
+  final Future<bool> Function(TravelAttachment attachment) onRemoveAttachment;
   final Future<void> Function(
     TravelAttachment attachment,
     Set<String> memberIds,
@@ -3954,8 +4055,8 @@ class _EventFilesDialogState extends State<EventFilesDialog>
   }
 
   Future<void> _removeAttachment(TravelAttachment attachment) async {
-    await widget.onRemoveAttachment(attachment);
-    if (!mounted) {
+    final removed = await widget.onRemoveAttachment(attachment);
+    if (!removed || !mounted) {
       return;
     }
 
