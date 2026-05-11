@@ -87,6 +87,6 @@ void main() {
     await tester.pump(const Duration(milliseconds: 250));
 
     expect(find.text('Compact Phone Trip'), findsOneWidget);
-    expect(find.text('CNY 5,000.00'), findsWidgets);
+    expect(find.textContaining('CNY 5,000.00'), findsWidgets);
   });
 }
