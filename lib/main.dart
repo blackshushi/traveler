@@ -242,9 +242,15 @@ double _rateToMyrForCurrency(TravelTrip trip, String code) {
   return currency.fallbackRateToMyr;
 }
 
+double _expenseEntryAmountInMyr(TravelTrip trip, TravelExpense expense) {
+  return expense.amount * _rateToMyrForCurrency(trip, expense.currencyCode);
+}
+
 double _expenseAmountInMyr(TravelTrip trip, TravelEvent event) {
-  return event.expenseAmount *
-      _rateToMyrForCurrency(trip, event.expenseCurrencyCode);
+  return event.expenses.fold<double>(
+    0,
+    (total, expense) => total + _expenseEntryAmountInMyr(trip, expense),
+  );
 }
 
 double _expenseAmountInTripCurrency(TravelTrip trip, TravelEvent event) {
@@ -351,6 +357,10 @@ String _buildTripShareText(TravelTrip trip) {
     }
 
     buffer.writeln('${event.timeRangeLabel}  |  ${event.title}');
+    final planMembers = _memberTagLabelsForIds(trip, event.planMemberIds);
+    if (planMembers.isNotEmpty) {
+      buffer.writeln('Travelers: ${planMembers.join(', ')}');
+    }
     if (event.planNotes.isNotEmpty) {
       buffer.writeln('Plan: ${event.planNotes}');
     }
@@ -360,16 +370,17 @@ String _buildTripShareText(TravelTrip trip) {
     if (event.feeling.isNotEmpty) {
       buffer.writeln('Feeling: ${event.feeling}');
     }
-    if (event.expenseAmount > 0) {
-      final members = _memberTagLabelsForIds(trip, event.expenseMemberIds);
-      final perPerson = event.splitCount <= 1
-          ? event.expenseAmount
-          : event.expenseAmount / event.splitCount;
+    for (final expense in event.expenses) {
+      final members = _memberTagLabelsForIds(trip, expense.memberIds);
+      final perPerson = expense.splitCount <= 1
+          ? expense.amount
+          : expense.amount / expense.splitCount;
       buffer.writeln(
         [
-          'Expense: ${_formatMoney(event.expenseCurrencyCode, event.expenseAmount)}',
-          if (event.splitCount > 1)
-            '${_formatMoney(event.expenseCurrencyCode, perPerson)} each',
+          'Expense: ${expense.title}',
+          _formatMoney(expense.currencyCode, expense.amount),
+          if (expense.splitCount > 1)
+            '${_formatMoney(expense.currencyCode, perPerson)} each',
           if (members.isNotEmpty) members.join(', '),
         ].join(' | '),
       );
@@ -569,6 +580,13 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
         expenseMemberIds: event.expenseMemberIds
             .where(memberIds.contains)
             .toList(),
+        expenses: [
+          for (final expense in event.expenses)
+            expense.copyWith(
+              memberIds: expense.memberIds.where(memberIds.contains).toList(),
+            ),
+        ],
+        planMemberIds: event.planMemberIds.where(memberIds.contains).toList(),
         attachments: cleanAttachments(event.attachments),
       );
     }).toList();
@@ -1899,6 +1917,7 @@ class TimelineEventCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
+    final planLabels = _memberTagLabelsForIds(trip, event.planMemberIds);
     final fileCount = _attachmentKindCount(
       event.attachments,
       AttachmentKind.file,
@@ -1907,6 +1926,7 @@ class TimelineEventCard extends StatelessWidget {
       event.attachments,
       AttachmentKind.photo,
     );
+    final eventExpenseTotal = _expenseAmountInTripCurrency(trip, event);
 
     return IntrinsicHeight(
       child: Row(
@@ -2053,7 +2073,7 @@ class TimelineEventCard extends StatelessWidget {
                                     label: Text('Flexible'),
                                     visualDensity: VisualDensity.compact,
                                   ),
-                                if (event.expenseAmount > 0)
+                                if (eventExpenseTotal > 0)
                                   Chip(
                                     avatar: const Icon(
                                       Icons.receipt_long_outlined,
@@ -2061,10 +2081,21 @@ class TimelineEventCard extends StatelessWidget {
                                     ),
                                     label: Text(
                                       _formatMoney(
-                                        event.expenseCurrencyCode,
-                                        event.expenseAmount,
+                                        trip.targetCurrency,
+                                        eventExpenseTotal,
                                       ),
                                     ),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                for (final label in planLabels)
+                                  Chip(
+                                    avatar: Icon(
+                                      label == 'All'
+                                          ? Icons.groups_outlined
+                                          : Icons.person_outline,
+                                      size: 18,
+                                    ),
+                                    label: Text(label),
                                     visualDensity: VisualDensity.compact,
                                   ),
                                 if (event.feeling.isNotEmpty)
@@ -2165,7 +2196,7 @@ class EventActionsSheet extends StatelessWidget {
                 ActionTile(
                   icon: Icons.receipt_long_outlined,
                   title: 'Expense',
-                  subtitle: 'Amount, currency, and split count',
+                  subtitle: 'Usage, amount, and travelers',
                   onTap: () => Navigator.of(context).pop(EventAction.expense),
                 ),
                 ActionTile(
@@ -2380,6 +2411,13 @@ class ExpenseDetailsPage extends StatefulWidget {
   State<ExpenseDetailsPage> createState() => _ExpenseDetailsPageState();
 }
 
+class _ExpenseListItem {
+  const _ExpenseListItem({required this.event, required this.expense});
+
+  final TravelEvent event;
+  final TravelExpense expense;
+}
+
 class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
   String? _selectedMemberId;
 
@@ -2398,39 +2436,40 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
     return null;
   }
 
-  List<TravelEvent> get _expenseEvents {
+  List<_ExpenseListItem> get _expenseItems {
     final selectedId = _selectedMemberId;
     return [
       for (final event in widget.trip.sortedEvents)
-        if (event.expenseAmount > 0 &&
-            (selectedId == null || event.expenseMemberIds.contains(selectedId)))
-          event,
+        for (final expense in event.expenses)
+          if (expense.amount > 0 &&
+              (selectedId == null || expense.memberIds.contains(selectedId)))
+            _ExpenseListItem(event: event, expense: expense),
     ];
   }
 
-  double _eventMyrAmount(TravelEvent event) {
-    final fullAmount = _expenseAmountInMyr(widget.trip, event);
+  double _expenseMyrAmount(TravelExpense expense) {
+    final fullAmount = _expenseEntryAmountInMyr(widget.trip, expense);
     return _selectedMemberId == null
         ? fullAmount
-        : fullAmount / max(1, event.splitCount);
+        : fullAmount / max(1, expense.splitCount);
   }
 
-  double _eventTripAmount(TravelEvent event) {
+  double _expenseTripAmount(TravelExpense expense) {
     final targetRate = max(widget.trip.exchangeRateToMyr, 0.000001);
-    return _eventMyrAmount(event) / targetRate;
+    return _expenseMyrAmount(expense) / targetRate;
   }
 
   @override
   Widget build(BuildContext context) {
     final selectedMember = _selectedMember;
-    final events = _expenseEvents;
-    final totalMyr = events.fold<double>(
+    final items = _expenseItems;
+    final totalMyr = items.fold<double>(
       0,
-      (total, event) => total + _eventMyrAmount(event),
+      (total, item) => total + _expenseMyrAmount(item.expense),
     );
-    final totalTrip = events.fold<double>(
+    final totalTrip = items.fold<double>(
       0,
-      (total, event) => total + _eventTripAmount(event),
+      (total, item) => total + _expenseTripAmount(item.expense),
     );
     final colors = Theme.of(context).colorScheme;
 
@@ -2491,7 +2530,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                 ),
               ),
               const SizedBox(height: 12),
-              if (events.isEmpty)
+              if (items.isEmpty)
                 Card(
                   child: Padding(
                     padding: const EdgeInsets.all(16),
@@ -2503,7 +2542,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                   ),
                 )
               else
-                for (final event in events) ...[
+                for (final item in items) ...[
                   Card(
                     child: Padding(
                       padding: const EdgeInsets.all(14),
@@ -2518,7 +2557,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text(
-                                      event.title,
+                                      item.expense.title,
                                       style: Theme.of(context)
                                           .textTheme
                                           .titleMedium
@@ -2528,7 +2567,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                                     ),
                                     const SizedBox(height: 4),
                                     Text(
-                                      '${_dayFormatter.format(event.startAt)} - ${event.timeRangeLabel}',
+                                      '${item.event.title} - ${_dayFormatter.format(item.event.startAt)} - ${item.event.timeRangeLabel}',
                                       style: Theme.of(context)
                                           .textTheme
                                           .bodySmall
@@ -2546,7 +2585,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                                   Text(
                                     _formatMoney(
                                       widget.trip.targetCurrency,
-                                      _eventTripAmount(event),
+                                      _expenseTripAmount(item.expense),
                                     ),
                                     style: Theme.of(context)
                                         .textTheme
@@ -2555,7 +2594,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                                   ),
                                   const SizedBox(height: 2),
                                   Text(
-                                    'MYR ${_moneyFormatter.format(_eventMyrAmount(event))}',
+                                    'MYR ${_moneyFormatter.format(_expenseMyrAmount(item.expense))}',
                                     style: Theme.of(
                                       context,
                                     ).textTheme.bodySmall,
@@ -2576,15 +2615,15 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                                 ),
                                 label: Text(
                                   _formatMoney(
-                                    event.expenseCurrencyCode,
-                                    event.expenseAmount,
+                                    item.expense.currencyCode,
+                                    item.expense.amount,
                                   ),
                                 ),
                                 visualDensity: VisualDensity.compact,
                               ),
                               for (final label in _memberTagLabelsForIds(
                                 widget.trip,
-                                event.expenseMemberIds,
+                                item.expense.memberIds,
                               ))
                                 Chip(
                                   avatar: Icon(
@@ -2628,6 +2667,7 @@ class JournalEventCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
+    final planLabels = _memberTagLabelsForIds(trip, event.planMemberIds);
 
     return Card(
       child: InkWell(
@@ -2713,6 +2753,38 @@ class JournalEventCard extends StatelessWidget {
                           ),
                       ],
                     ),
+                    if (event.planNotes.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        event.planNotes,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: colors.onSurfaceVariant,
+                          height: 1.25,
+                        ),
+                      ),
+                    ],
+                    if (planLabels.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
+                        children: [
+                          for (final label in planLabels)
+                            Chip(
+                              avatar: Icon(
+                                label == 'All'
+                                    ? Icons.groups_outlined
+                                    : Icons.person_outline,
+                                size: 16,
+                              ),
+                              label: Text(label),
+                              visualDensity: VisualDensity.compact,
+                              materialTapTargetSize:
+                                  MaterialTapTargetSize.shrinkWrap,
+                            ),
+                        ],
+                      ),
+                    ],
                     if (event.journal.isNotEmpty) ...[
                       const SizedBox(height: 8),
                       Text(
@@ -2730,7 +2802,7 @@ class JournalEventCard extends StatelessWidget {
                         text: event.location,
                       ),
                     ],
-                    if (event.expenseAmount > 0) ...[
+                    if (event.expenses.isNotEmpty) ...[
                       const SizedBox(height: 12),
                       JournalBillPanel(trip: trip, event: event),
                     ],
@@ -2755,10 +2827,7 @@ class JournalBillPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
-    final perPerson = event.splitCount <= 1
-        ? event.expenseAmount
-        : event.expenseAmount / event.splitCount;
-    final splitLabels = _memberTagLabelsForIds(trip, event.expenseMemberIds);
+    final totalTrip = _expenseAmountInTripCurrency(trip, event);
 
     return Container(
       width: double.infinity,
@@ -2774,37 +2843,72 @@ class JournalBillPanel extends StatelessWidget {
           Align(
             alignment: Alignment.centerRight,
             child: Text(
-              _formatMoney(event.expenseCurrencyCode, event.expenseAmount),
+              _formatMoney(trip.targetCurrency, totalTrip),
               style: theme.textTheme.titleMedium?.copyWith(
                 fontWeight: FontWeight.w800,
               ),
             ),
           ),
-          if (event.splitCount > 1 || splitLabels.isNotEmpty) ...[
-            const SizedBox(height: 10),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                if (event.splitCount > 1)
-                  _JournalBillPill(
-                    icon: Icons.group_outlined,
-                    text:
-                        '${_formatMoney(event.expenseCurrencyCode, perPerson)} each',
-                  ),
-                for (final label in splitLabels)
-                  _JournalBillPill(
-                    icon: label == 'All'
-                        ? Icons.groups_outlined
-                        : Icons.person_outline,
-                    text: label,
-                  ),
-              ],
-            ),
+          const SizedBox(height: 10),
+          for (final expense in event.expenses) ...[
+            _JournalExpenseLine(trip: trip, expense: expense),
+            if (expense != event.expenses.last) const SizedBox(height: 10),
           ],
         ],
       ),
+    );
+  }
+}
+
+class _JournalExpenseLine extends StatelessWidget {
+  const _JournalExpenseLine({required this.trip, required this.expense});
+
+  final TravelTrip trip;
+  final TravelExpense expense;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final labels = _memberTagLabelsForIds(trip, expense.memberIds);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Text(
+                expense.title,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              _formatMoney(expense.currencyCode, expense.amount),
+              style: theme.textTheme.bodyMedium,
+            ),
+          ],
+        ),
+        if (labels.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              for (final label in labels)
+                _JournalBillPill(
+                  icon: label == 'All'
+                      ? Icons.groups_outlined
+                      : Icons.person_outline,
+                  text: label,
+                ),
+            ],
+          ),
+        ],
+      ],
     );
   }
 }
@@ -2970,46 +3074,6 @@ class _CurrencyTabState extends State<CurrencyTab> {
                       style: Theme.of(context).textTheme.titleLarge,
                     ),
                     const SizedBox(height: 16),
-                    DropdownButtonFormField<String>(
-                      key: ValueKey('converter_$_selectedCurrency'),
-                      initialValue: _selectedCurrency,
-                      decoration: const InputDecoration(
-                        labelText: 'Trip currency',
-                        prefixIcon: Icon(Icons.payments_outlined),
-                      ),
-                      items: [
-                        for (final currency in _supportedCurrencies)
-                          DropdownMenuItem(
-                            value: currency.code,
-                            child: Text(currency.label),
-                          ),
-                      ],
-                      onChanged: (value) {
-                        if (value != null) {
-                          _selectCurrency(value);
-                        }
-                      },
-                    ),
-                    const SizedBox(height: 16),
-                    SegmentedButton<bool>(
-                      segments: [
-                        ButtonSegment(
-                          value: true,
-                          icon: const Icon(Icons.arrow_forward),
-                          label: Text('$_selectedCurrency to MYR'),
-                        ),
-                        ButtonSegment(
-                          value: false,
-                          icon: const Icon(Icons.arrow_back),
-                          label: Text('MYR to $_selectedCurrency'),
-                        ),
-                      ],
-                      selected: {_fromTarget},
-                      onSelectionChanged: (value) {
-                        setState(() => _fromTarget = value.first);
-                      },
-                    ),
-                    const SizedBox(height: 16),
                     TextField(
                       controller: _amountController,
                       keyboardType: const TextInputType.numberWithOptions(
@@ -3023,6 +3087,29 @@ class _CurrencyTabState extends State<CurrencyTab> {
                       onChanged: (_) => setState(() {}),
                     ),
                     const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFEAF6F2),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Converted amount',
+                            style: Theme.of(context).textTheme.labelLarge,
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            '$toCode ${_moneyFormatter.format(converted)}',
+                            style: Theme.of(context).textTheme.headlineSmall
+                                ?.copyWith(fontWeight: FontWeight.w800),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
                     TextField(
                       controller: _rateController,
                       keyboardType: const TextInputType.numberWithOptions(
@@ -3046,7 +3133,7 @@ class _CurrencyTabState extends State<CurrencyTab> {
                       onTapOutside: (_) => FocusScope.of(context).unfocus(),
                       onChanged: (_) => setState(() {}),
                     ),
-                    const SizedBox(height: 16),
+                    const SizedBox(height: 12),
                     Wrap(
                       spacing: 8,
                       runSpacing: 8,
@@ -3082,28 +3169,45 @@ class _CurrencyTabState extends State<CurrencyTab> {
                         ),
                       ],
                     ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            Card(
-              color: const Color(0xFFEAF6F2),
-              child: Padding(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '$fromCode ${_moneyFormatter.format(amount)}',
-                      style: Theme.of(context).textTheme.titleMedium,
+                    const SizedBox(height: 16),
+                    SegmentedButton<bool>(
+                      segments: [
+                        ButtonSegment(
+                          value: true,
+                          icon: const Icon(Icons.arrow_forward),
+                          label: Text('$_selectedCurrency to MYR'),
+                        ),
+                        ButtonSegment(
+                          value: false,
+                          icon: const Icon(Icons.arrow_back),
+                          label: Text('MYR to $_selectedCurrency'),
+                        ),
+                      ],
+                      selected: {_fromTarget},
+                      onSelectionChanged: (value) {
+                        setState(() => _fromTarget = value.first);
+                      },
                     ),
-                    const SizedBox(height: 8),
-                    Text(
-                      '$toCode ${_moneyFormatter.format(converted)}',
-                      style: Theme.of(context).textTheme.displaySmall?.copyWith(
-                        fontWeight: FontWeight.w800,
+                    const SizedBox(height: 16),
+                    DropdownButtonFormField<String>(
+                      key: ValueKey('converter_$_selectedCurrency'),
+                      initialValue: _selectedCurrency,
+                      decoration: const InputDecoration(
+                        labelText: 'Trip currency',
+                        prefixIcon: Icon(Icons.payments_outlined),
                       ),
+                      items: [
+                        for (final currency in _supportedCurrencies)
+                          DropdownMenuItem(
+                            value: currency.code,
+                            child: Text(currency.label),
+                          ),
+                      ],
+                      onChanged: (value) {
+                        if (value != null) {
+                          _selectCurrency(value);
+                        }
+                      },
                     ),
                   ],
                 ),
@@ -4661,6 +4765,66 @@ class _TripFormDialogState extends State<TripFormDialog> {
   }
 }
 
+class _ExpenseFormRow {
+  _ExpenseFormRow({
+    required this.id,
+    required String title,
+    required String amount,
+    required this.currencyCode,
+    required int splitCount,
+    required this.memberIds,
+    required this.inputMode,
+  }) : titleController = TextEditingController(text: title),
+       amountController = TextEditingController(text: amount),
+       splitController = TextEditingController(text: splitCount.toString());
+
+  factory _ExpenseFormRow.blank(String currencyCode) {
+    return _ExpenseFormRow(
+      id: _newId('expense'),
+      title: '',
+      amount: '',
+      currencyCode: currencyCode,
+      splitCount: 1,
+      memberIds: <String>{},
+      inputMode: ExpenseInputMode.total,
+    );
+  }
+
+  factory _ExpenseFormRow.fromExpense(TravelExpense expense) {
+    return _ExpenseFormRow(
+      id: expense.id,
+      title: expense.title,
+      amount: expense.amount == 0 ? '' : expense.amount.toStringAsFixed(2),
+      currencyCode: expense.currencyCode,
+      splitCount: expense.splitCount,
+      memberIds: expense.memberIds.toSet(),
+      inputMode: ExpenseInputMode.total,
+    );
+  }
+
+  final String id;
+  final TextEditingController titleController;
+  final TextEditingController amountController;
+  final TextEditingController splitController;
+  String currencyCode;
+  ExpenseInputMode inputMode;
+  Set<String> memberIds;
+
+  void addAmountListener(VoidCallback listener) {
+    amountController.addListener(listener);
+  }
+
+  void removeAmountListener(VoidCallback listener) {
+    amountController.removeListener(listener);
+  }
+
+  void dispose() {
+    titleController.dispose();
+    amountController.dispose();
+    splitController.dispose();
+  }
+}
+
 class EventFormDialog extends StatefulWidget {
   const EventFormDialog({
     super.key,
@@ -4685,15 +4849,12 @@ class _EventFormDialogState extends State<EventFormDialog> {
   late final TextEditingController _planController;
   late final TextEditingController _journalController;
   late final TextEditingController _feelingController;
-  late final TextEditingController _expenseController;
-  late final TextEditingController _splitController;
   late DateTime _date;
   late TimeOfDay _time;
   late TimeOfDay _endTime;
   late bool _isFlexible;
-  var _expenseInputMode = ExpenseInputMode.total;
-  late String _selectedExpenseCurrency;
-  late Set<String> _selectedExpenseMemberIds;
+  late Set<String> _selectedPlanMemberIds;
+  late List<_ExpenseFormRow> _expenseRows;
 
   @override
   void initState() {
@@ -4708,38 +4869,37 @@ class _EventFormDialogState extends State<EventFormDialog> {
     _planController = TextEditingController(text: event?.planNotes ?? '');
     _journalController = TextEditingController(text: event?.journal ?? '');
     _feelingController = TextEditingController(text: event?.feeling ?? '');
-    _expenseController = TextEditingController(
-      text: event == null || event.expenseAmount == 0
-          ? ''
-          : event.expenseAmount.toStringAsFixed(2),
-    );
-    _expenseController.addListener(_handleExpenseAmountChanged);
-    _splitController = TextEditingController(
-      text: (event?.splitCount ?? 1).toString(),
-    );
     _date = DateTime(startAt.year, startAt.month, startAt.day);
     _time = TimeOfDay.fromDateTime(startAt);
     _endTime = TimeOfDay.fromDateTime(
       startAt.add(Duration(minutes: event?.durationMinutes ?? 60)),
     );
     _isFlexible = event?.isFlexible ?? false;
-    _selectedExpenseCurrency = _currencyForCode(
-      event?.expenseCurrencyCode ?? widget.trip.targetCurrency,
-    ).code;
-    _selectedExpenseMemberIds = {...?event?.expenseMemberIds};
+    _selectedPlanMemberIds = {...?event?.planMemberIds};
+    final existingExpenses = event?.expenses ?? const <TravelExpense>[];
+    _expenseRows = existingExpenses.isEmpty
+        ? [_ExpenseFormRow.blank(widget.trip.targetCurrency)]
+        : [
+            for (final expense in existingExpenses)
+              _ExpenseFormRow.fromExpense(expense),
+          ];
+    for (final row in _expenseRows) {
+      row.addAmountListener(_handleExpenseAmountChanged);
+    }
   }
 
   @override
   void dispose() {
-    _expenseController.removeListener(_handleExpenseAmountChanged);
     _titleController.dispose();
     _locationController.dispose();
     _durationController.dispose();
     _planController.dispose();
     _journalController.dispose();
     _feelingController.dispose();
-    _expenseController.dispose();
-    _splitController.dispose();
+    for (final row in _expenseRows) {
+      row.removeAmountListener(_handleExpenseAmountChanged);
+      row.dispose();
+    }
     super.dispose();
   }
 
@@ -4747,6 +4907,27 @@ class _EventFormDialogState extends State<EventFormDialog> {
     if (mounted) {
       setState(() {});
     }
+  }
+
+  void _addExpenseRow() {
+    final row = _ExpenseFormRow.blank(widget.trip.targetCurrency);
+    row.addAmountListener(_handleExpenseAmountChanged);
+    setState(() => _expenseRows = [..._expenseRows, row]);
+  }
+
+  void _removeExpenseRow(_ExpenseFormRow row) {
+    row.removeAmountListener(_handleExpenseAmountChanged);
+    row.dispose();
+    setState(() {
+      _expenseRows = _expenseRows
+          .where((candidate) => candidate.id != row.id)
+          .toList();
+      if (_expenseRows.isEmpty) {
+        final replacement = _ExpenseFormRow.blank(widget.trip.targetCurrency);
+        replacement.addAmountListener(_handleExpenseAmountChanged);
+        _expenseRows = [replacement];
+      }
+    });
   }
 
   Future<void> _pickDate() async {
@@ -4797,16 +4978,35 @@ class _EventFormDialogState extends State<EventFormDialog> {
       return;
     }
 
-    final enteredExpense = _expenseController.text.trim().isEmpty
-        ? 0.0
-        : double.parse(_expenseController.text.trim());
-    final selectedSplit = _selectedExpenseMemberIds.length;
-    final split = selectedSplit == 0
-        ? int.tryParse(_splitController.text.trim()) ?? 1
-        : selectedSplit;
-    final expense = _expenseInputMode == ExpenseInputMode.perPerson
-        ? enteredExpense * max(1, split)
-        : enteredExpense;
+    final expenses = <TravelExpense>[];
+    for (final row in _expenseRows) {
+      final enteredAmount = row.amountController.text.trim().isEmpty
+          ? 0.0
+          : double.parse(row.amountController.text.trim());
+      if (enteredAmount <= 0) {
+        continue;
+      }
+
+      final split = row.memberIds.isEmpty
+          ? int.tryParse(row.splitController.text.trim()) ?? 1
+          : row.memberIds.length;
+      final amount = row.inputMode == ExpenseInputMode.perPerson
+          ? enteredAmount * max(1, split)
+          : enteredAmount;
+      expenses.add(
+        TravelExpense(
+          id: row.id,
+          title: row.titleController.text.trim().isEmpty
+              ? 'Expense'
+              : row.titleController.text.trim(),
+          amount: amount,
+          currencyCode: _currencyForCode(row.currencyCode).code,
+          splitCount: max(1, split),
+          memberIds: row.memberIds.toList(),
+        ),
+      );
+    }
+    final primaryExpense = expenses.isEmpty ? null : expenses.first;
     final duration = _isFlexible ? 0 : _minutesBetween(_time, _endTime);
     final startAt = DateTime(
       _date.year,
@@ -4826,23 +5026,26 @@ class _EventFormDialogState extends State<EventFormDialog> {
         planNotes: _planController.text.trim(),
         journal: _journalController.text.trim(),
         feeling: _feelingController.text.trim(),
-        expenseAmount: expense,
-        expenseCurrencyCode: _selectedExpenseCurrency,
-        splitCount: max(1, split),
+        expenseAmount: primaryExpense?.amount ?? 0,
+        expenseCurrencyCode:
+            primaryExpense?.currencyCode ?? widget.trip.targetCurrency,
+        splitCount: primaryExpense?.splitCount ?? 1,
         isFlexible: _isFlexible,
         attachments: widget.event?.attachments ?? const [],
-        expenseMemberIds: _selectedExpenseMemberIds.toList(),
+        expenseMemberIds: primaryExpense?.memberIds ?? const <String>[],
+        expenses: expenses,
+        planMemberIds: _selectedPlanMemberIds.toList(),
       ),
     );
   }
 
-  String _convertedExpensePreview() {
-    final amount = double.tryParse(_expenseController.text.trim()) ?? 0;
+  String _convertedExpensePreview(_ExpenseFormRow row) {
+    final amount = double.tryParse(row.amountController.text.trim()) ?? 0;
     if (amount <= 0) {
       return 'Enter an amount to preview conversion';
     }
 
-    final fromCode = _currencyForCode(_selectedExpenseCurrency).code;
+    final fromCode = _currencyForCode(row.currencyCode).code;
     final tripCurrency = _currencyForCode(widget.trip.targetCurrency).code;
     if (fromCode == 'MYR') {
       final converted = amount / max(widget.trip.exchangeRateToMyr, 0.000001);
@@ -4851,6 +5054,159 @@ class _EventFormDialogState extends State<EventFormDialog> {
 
     final converted = amount * _rateToMyrForCurrency(widget.trip, fromCode);
     return 'Approx. ${_formatMoney('MYR', converted)}';
+  }
+
+  Widget _buildExpenseEditor(_ExpenseFormRow row, int index) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Expense ${index + 1}',
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                if (_expenseRows.length > 1)
+                  IconButton(
+                    tooltip: 'Remove expense',
+                    onPressed: () => _removeExpenseRow(row),
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.close),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            TextFormField(
+              controller: row.titleController,
+              decoration: const InputDecoration(
+                labelText: 'Usage',
+                prefixIcon: Icon(Icons.title_outlined),
+              ),
+              textInputAction: TextInputAction.next,
+            ),
+            const SizedBox(height: 12),
+            SegmentedButton<ExpenseInputMode>(
+              segments: const [
+                ButtonSegment(
+                  value: ExpenseInputMode.total,
+                  icon: Icon(Icons.payments_outlined),
+                  label: Text('Total'),
+                ),
+                ButtonSegment(
+                  value: ExpenseInputMode.perPerson,
+                  icon: Icon(Icons.person_outline),
+                  label: Text('Per pax'),
+                ),
+              ],
+              selected: {row.inputMode},
+              onSelectionChanged: (value) {
+                setState(() => row.inputMode = value.first);
+              },
+            ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              initialValue: row.currencyCode,
+              decoration: const InputDecoration(
+                labelText: 'Currency',
+                prefixIcon: Icon(Icons.payments_outlined),
+              ),
+              items: [
+                for (final currency in _supportedCurrencies)
+                  DropdownMenuItem(
+                    value: currency.code,
+                    child: Text(currency.label),
+                  ),
+              ],
+              onChanged: (value) {
+                if (value != null) {
+                  setState(() => row.currencyCode = value);
+                }
+              },
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: row.amountController,
+              decoration: InputDecoration(
+                labelText:
+                    '${row.inputMode == ExpenseInputMode.total ? 'Total' : 'Per pax'} ${row.currencyCode}',
+                prefixIcon: const Icon(Icons.receipt_long_outlined),
+              ),
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              validator: _optionalPositiveNumberValidator,
+            ),
+            const SizedBox(height: 12),
+            InputDecorator(
+              decoration: InputDecoration(
+                labelText:
+                    'Converted ${row.inputMode == ExpenseInputMode.perPerson ? 'per pax' : 'total'}',
+                prefixIcon: const Icon(Icons.currency_exchange),
+                border: const OutlineInputBorder(),
+              ),
+              child: Text(_convertedExpensePreview(row)),
+            ),
+            const SizedBox(height: 12),
+            if (widget.trip.members.isNotEmpty) ...[
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Split with',
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final member in widget.trip.members)
+                      FilterChip(
+                        avatar: const Icon(Icons.person_outline, size: 18),
+                        label: Text(member.name),
+                        selected: row.memberIds.contains(member.id),
+                        onSelected: (selected) {
+                          setState(() {
+                            if (selected) {
+                              row.memberIds.add(member.id);
+                            } else {
+                              row.memberIds.remove(member.id);
+                            }
+                            row.splitController.text = max(
+                              1,
+                              row.memberIds.length,
+                            ).toString();
+                          });
+                        },
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
+            TextFormField(
+              controller: row.splitController,
+              decoration: const InputDecoration(
+                labelText: 'Split count',
+                prefixIcon: Icon(Icons.group_outlined),
+              ),
+              enabled: row.memberIds.isEmpty,
+              keyboardType: TextInputType.number,
+              validator: _positiveIntegerValidator,
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -4950,6 +5306,46 @@ class _EventFormDialogState extends State<EventFormDialog> {
                       minLines: 3,
                       maxLines: 5,
                     ),
+                    if (widget.trip.members.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          'Involved travelers',
+                          style: Theme.of(context).textTheme.labelLarge,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            for (final member in widget.trip.members)
+                              FilterChip(
+                                avatar: const Icon(
+                                  Icons.person_outline,
+                                  size: 18,
+                                ),
+                                label: Text(member.name),
+                                selected: _selectedPlanMemberIds.contains(
+                                  member.id,
+                                ),
+                                onSelected: (selected) {
+                                  setState(() {
+                                    if (selected) {
+                                      _selectedPlanMemberIds.add(member.id);
+                                    } else {
+                                      _selectedPlanMemberIds.remove(member.id);
+                                    }
+                                  });
+                                },
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ],
                   if (isExperienceMode) ...[
                     TextFormField(
@@ -4972,119 +5368,21 @@ class _EventFormDialogState extends State<EventFormDialog> {
                     ),
                   ],
                   if (isExpenseMode) ...[
-                    SegmentedButton<ExpenseInputMode>(
-                      segments: const [
-                        ButtonSegment(
-                          value: ExpenseInputMode.total,
-                          icon: Icon(Icons.payments_outlined),
-                          label: Text('Total'),
-                        ),
-                        ButtonSegment(
-                          value: ExpenseInputMode.perPerson,
-                          icon: Icon(Icons.person_outline),
-                          label: Text('Per pax'),
-                        ),
-                      ],
-                      selected: {_expenseInputMode},
-                      onSelectionChanged: (value) {
-                        setState(() => _expenseInputMode = value.first);
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    DropdownButtonFormField<String>(
-                      initialValue: _selectedExpenseCurrency,
-                      decoration: const InputDecoration(
-                        labelText: 'Expense currency',
-                        prefixIcon: Icon(Icons.payments_outlined),
-                      ),
-                      items: [
-                        for (final currency in _supportedCurrencies)
-                          DropdownMenuItem(
-                            value: currency.code,
-                            child: Text(currency.label),
-                          ),
-                      ],
-                      onChanged: (value) {
-                        if (value != null) {
-                          setState(() => _selectedExpenseCurrency = value);
-                        }
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    TextFormField(
-                      controller: _expenseController,
-                      decoration: InputDecoration(
-                        labelText:
-                            '${_expenseInputMode == ExpenseInputMode.total ? 'Total' : 'Per pax'} $_selectedExpenseCurrency',
-                        prefixIcon: const Icon(Icons.receipt_long_outlined),
-                      ),
-                      keyboardType: const TextInputType.numberWithOptions(
-                        decimal: true,
-                      ),
-                      validator: _optionalPositiveNumberValidator,
-                    ),
-                    const SizedBox(height: 12),
-                    InputDecorator(
-                      decoration: InputDecoration(
-                        labelText:
-                            'Converted ${_expenseInputMode == ExpenseInputMode.perPerson ? 'per pax' : 'total'}',
-                        prefixIcon: const Icon(Icons.currency_exchange),
-                        border: const OutlineInputBorder(),
-                      ),
-                      child: Text(_convertedExpensePreview()),
-                    ),
-                    const SizedBox(height: 12),
-                    if (widget.trip.members.isNotEmpty) ...[
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: Text(
-                          'Split with',
-                          style: Theme.of(context).textTheme.labelLarge,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Align(
-                        alignment: Alignment.centerLeft,
-                        child: Wrap(
-                          spacing: 8,
-                          runSpacing: 8,
-                          children: [
-                            for (final member in widget.trip.members)
-                              FilterChip(
-                                label: Text(member.name),
-                                selected: _selectedExpenseMemberIds.contains(
-                                  member.id,
-                                ),
-                                onSelected: (selected) {
-                                  setState(() {
-                                    if (selected) {
-                                      _selectedExpenseMemberIds.add(member.id);
-                                    } else {
-                                      _selectedExpenseMemberIds.remove(
-                                        member.id,
-                                      );
-                                    }
-                                    _splitController.text = max(
-                                      1,
-                                      _selectedExpenseMemberIds.length,
-                                    ).toString();
-                                  });
-                                },
-                              ),
-                          ],
-                        ),
-                      ),
+                    for (
+                      var index = 0;
+                      index < _expenseRows.length;
+                      index++
+                    ) ...[
+                      _buildExpenseEditor(_expenseRows[index], index),
                       const SizedBox(height: 12),
                     ],
-                    TextFormField(
-                      controller: _splitController,
-                      decoration: const InputDecoration(
-                        labelText: 'Split count',
-                        prefixIcon: Icon(Icons.group_outlined),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: OutlinedButton.icon(
+                        onPressed: _addExpenseRow,
+                        icon: const Icon(Icons.add),
+                        label: const Text('Expense'),
                       ),
-                      enabled: _selectedExpenseMemberIds.isEmpty,
-                      keyboardType: TextInputType.number,
-                      validator: _positiveIntegerValidator,
                     ),
                   ],
                   if (!isPlanMode && widget.event != null) ...[
@@ -5321,6 +5619,64 @@ class TravelMember {
   }
 }
 
+class TravelExpense {
+  const TravelExpense({
+    required this.id,
+    required this.title,
+    required this.amount,
+    required this.currencyCode,
+    required this.splitCount,
+    required this.memberIds,
+  });
+
+  factory TravelExpense.fromJson(
+    Map<String, Object?> json, {
+    String fallbackCurrencyCode = 'CNY',
+  }) {
+    return TravelExpense(
+      id: json['id'] as String? ?? _newId('expense'),
+      title: json['title'] as String? ?? 'Expense',
+      amount: (json['amount'] as num?)?.toDouble() ?? 0,
+      currencyCode: _currencyForCode(
+        json['currencyCode'] as String? ?? fallbackCurrencyCode,
+      ).code,
+      splitCount: (json['splitCount'] as num?)?.toInt() ?? 1,
+      memberIds: (json['memberIds'] as List? ?? const [])
+          .whereType<String>()
+          .toList(),
+    );
+  }
+
+  final String id;
+  final String title;
+  final double amount;
+  final String currencyCode;
+  final int splitCount;
+  final List<String> memberIds;
+
+  TravelExpense copyWith({List<String>? memberIds}) {
+    return TravelExpense(
+      id: id,
+      title: title,
+      amount: amount,
+      currencyCode: currencyCode,
+      splitCount: splitCount,
+      memberIds: memberIds ?? this.memberIds,
+    );
+  }
+
+  Map<String, Object?> toJson() {
+    return {
+      'id': id,
+      'title': title,
+      'amount': amount,
+      'currencyCode': currencyCode,
+      'splitCount': splitCount,
+      'memberIds': memberIds,
+    };
+  }
+}
+
 class TravelEvent {
   const TravelEvent({
     required this.id,
@@ -5337,12 +5693,46 @@ class TravelEvent {
     required this.isFlexible,
     required this.attachments,
     required this.expenseMemberIds,
+    required this.expenses,
+    required this.planMemberIds,
   });
 
   factory TravelEvent.fromJson(
     Map<String, Object?> json, {
     String fallbackExpenseCurrencyCode = 'CNY',
   }) {
+    final legacyAmount = (json['expenseAmount'] as num?)?.toDouble() ?? 0;
+    final legacyCurrency = _currencyForCode(
+      json['expenseCurrencyCode'] as String? ?? fallbackExpenseCurrencyCode,
+    ).code;
+    final legacySplitCount = (json['splitCount'] as num?)?.toInt() ?? 1;
+    final legacyMemberIds = (json['expenseMemberIds'] as List? ?? const [])
+        .whereType<String>()
+        .toList();
+    final expenses = (json['expenses'] as List? ?? const [])
+        .whereType<Map<String, Object?>>()
+        .map(
+          (expense) => TravelExpense.fromJson(
+            expense,
+            fallbackCurrencyCode: legacyCurrency,
+          ),
+        )
+        .where((expense) => expense.amount > 0)
+        .toList();
+    if (expenses.isEmpty && legacyAmount > 0) {
+      expenses.add(
+        TravelExpense(
+          id: _newId('expense'),
+          title: json['expenseTitle'] as String? ?? 'Expense',
+          amount: legacyAmount,
+          currencyCode: legacyCurrency,
+          splitCount: legacySplitCount,
+          memberIds: legacyMemberIds,
+        ),
+      );
+    }
+    final primaryExpense = expenses.isEmpty ? null : expenses.first;
+
     return TravelEvent(
       id: json['id'] as String? ?? _newId('event'),
       title: json['title'] as String? ?? 'Untitled event',
@@ -5353,17 +5743,17 @@ class TravelEvent {
       planNotes: json['planNotes'] as String? ?? '',
       journal: json['journal'] as String? ?? '',
       feeling: json['feeling'] as String? ?? '',
-      expenseAmount: (json['expenseAmount'] as num?)?.toDouble() ?? 0,
-      expenseCurrencyCode: _currencyForCode(
-        json['expenseCurrencyCode'] as String? ?? fallbackExpenseCurrencyCode,
-      ).code,
-      splitCount: (json['splitCount'] as num?)?.toInt() ?? 1,
+      expenseAmount: primaryExpense?.amount ?? 0,
+      expenseCurrencyCode: primaryExpense?.currencyCode ?? legacyCurrency,
+      splitCount: primaryExpense?.splitCount ?? legacySplitCount,
       isFlexible: json['isFlexible'] as bool? ?? false,
       attachments: (json['attachments'] as List? ?? const [])
           .whereType<Map<String, Object?>>()
           .map(TravelAttachment.fromJson)
           .toList(),
-      expenseMemberIds: (json['expenseMemberIds'] as List? ?? const [])
+      expenseMemberIds: primaryExpense?.memberIds ?? legacyMemberIds,
+      expenses: expenses,
+      planMemberIds: (json['planMemberIds'] as List? ?? const [])
           .whereType<String>()
           .toList(),
     );
@@ -5383,6 +5773,8 @@ class TravelEvent {
   final bool isFlexible;
   final List<TravelAttachment> attachments;
   final List<String> expenseMemberIds;
+  final List<TravelExpense> expenses;
+  final List<String> planMemberIds;
 
   String get timeRangeLabel {
     final start = _timeFormatter.format(startAt);
@@ -5408,6 +5800,8 @@ class TravelEvent {
     bool? isFlexible,
     List<TravelAttachment>? attachments,
     List<String>? expenseMemberIds,
+    List<TravelExpense>? expenses,
+    List<String>? planMemberIds,
   }) {
     return TravelEvent(
       id: id,
@@ -5424,6 +5818,8 @@ class TravelEvent {
       isFlexible: isFlexible ?? this.isFlexible,
       attachments: attachments ?? this.attachments,
       expenseMemberIds: expenseMemberIds ?? this.expenseMemberIds,
+      expenses: expenses ?? this.expenses,
+      planMemberIds: planMemberIds ?? this.planMemberIds,
     );
   }
 
@@ -5445,6 +5841,8 @@ class TravelEvent {
           .map((attachment) => attachment.toJson())
           .toList(),
       'expenseMemberIds': expenseMemberIds,
+      'expenses': expenses.map((expense) => expense.toJson()).toList(),
+      'planMemberIds': planMemberIds,
     };
   }
 }
