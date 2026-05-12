@@ -205,6 +205,23 @@ Uint8List? _attachmentBytes(TravelAttachment attachment) {
   }
 }
 
+Future<Uint8List?> _pickedFileBytes(PlatformFile file) async {
+  final bytes = file.bytes;
+  if (bytes != null) {
+    return bytes;
+  }
+
+  if (kIsWeb || file.path == null || file.path!.isEmpty) {
+    return null;
+  }
+
+  try {
+    return await file.xFile.readAsBytes();
+  } on Object {
+    return null;
+  }
+}
+
 Future<ImageSource?> _showPhotoSourceSheet(BuildContext context) {
   return showModalBottomSheet<ImageSource>(
     context: context,
@@ -871,7 +888,7 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     final result = await FilePicker.pickFiles(
       dialogTitle: 'Attach file to ${targetEvent.title}',
       allowMultiple: false,
-      withData: kIsWeb,
+      withData: true,
     );
 
     if (result == null || result.files.isEmpty) {
@@ -879,14 +896,20 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     }
 
     final file = result.files.single;
+    final bytes = await _pickedFileBytes(file);
+    if (bytes == null) {
+      _showSnack('Could not save a durable copy of ${file.name}.');
+      return null;
+    }
+
     final attachment = TravelAttachment(
       id: _newId('file'),
       name: file.name,
       path: file.path,
-      bytesBase64: file.bytes == null ? null : base64Encode(file.bytes!),
+      bytesBase64: base64Encode(bytes),
       mimeType: file.extension == null ? null : _guessMimeType(file.extension),
       kind: AttachmentKind.file,
-      sizeBytes: file.size,
+      sizeBytes: bytes.length,
       addedAt: DateTime.now(),
       memberIds: const [],
     );
@@ -1139,7 +1162,9 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     }
 
     if (!launched) {
-      _showSnack('Could not open ${attachment.name}.');
+      _showSnack(
+        'Could not open ${attachment.name}. Attach it again once to save a durable copy.',
+      );
     }
   }
 
