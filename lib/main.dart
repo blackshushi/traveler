@@ -335,6 +335,105 @@ String _paidShareStatusLabel(String label) {
   return label == 'All' ? 'All paid' : '$label paid';
 }
 
+class _MemberBalance {
+  _MemberBalance(this.member, this.amountMyr);
+
+  final TravelMember member;
+  double amountMyr;
+}
+
+class _ExpenseSettlement {
+  const _ExpenseSettlement({
+    required this.debtor,
+    required this.creditor,
+    required this.amountMyr,
+  });
+
+  final TravelMember debtor;
+  final TravelMember creditor;
+  final double amountMyr;
+}
+
+List<_ExpenseSettlement> _expenseSettlementsForTrip(TravelTrip trip) {
+  final memberById = {for (final member in trip.members) member.id: member};
+  final balances = {for (final member in trip.members) member.id: 0.0};
+
+  for (final event in trip.events) {
+    for (final expense in event.expenses) {
+      String? payerId;
+      for (final id in expense.payerMemberIds) {
+        if (memberById.containsKey(id)) {
+          payerId = id;
+          break;
+        }
+      }
+      if (payerId == null) {
+        continue;
+      }
+
+      final splitMemberIds = expense.memberIds
+          .where(memberById.containsKey)
+          .toSet();
+      if (splitMemberIds.isEmpty) {
+        continue;
+      }
+
+      final paidMemberIds = expense.paidMemberIds.toSet();
+      final shareMyr =
+          _expenseEntryAmountInMyr(trip, expense) / max(1, expense.splitCount);
+
+      for (final debtorId in splitMemberIds) {
+        if (debtorId == payerId || paidMemberIds.contains(debtorId)) {
+          continue;
+        }
+
+        balances[payerId] = (balances[payerId] ?? 0) + shareMyr;
+        balances[debtorId] = (balances[debtorId] ?? 0) - shareMyr;
+      }
+    }
+  }
+
+  final debtors = [
+    for (final entry in balances.entries)
+      if (entry.value < -0.01)
+        _MemberBalance(memberById[entry.key]!, -entry.value),
+  ]..sort((a, b) => a.member.name.compareTo(b.member.name));
+  final creditors = [
+    for (final entry in balances.entries)
+      if (entry.value > 0.01)
+        _MemberBalance(memberById[entry.key]!, entry.value),
+  ]..sort((a, b) => a.member.name.compareTo(b.member.name));
+
+  final settlements = <_ExpenseSettlement>[];
+  var debtorIndex = 0;
+  var creditorIndex = 0;
+  while (debtorIndex < debtors.length && creditorIndex < creditors.length) {
+    final debtor = debtors[debtorIndex];
+    final creditor = creditors[creditorIndex];
+    final amountMyr = min(debtor.amountMyr, creditor.amountMyr);
+    if (amountMyr > 0.01) {
+      settlements.add(
+        _ExpenseSettlement(
+          debtor: debtor.member,
+          creditor: creditor.member,
+          amountMyr: amountMyr,
+        ),
+      );
+    }
+
+    debtor.amountMyr -= amountMyr;
+    creditor.amountMyr -= amountMyr;
+    if (debtor.amountMyr <= 0.01) {
+      debtorIndex += 1;
+    }
+    if (creditor.amountMyr <= 0.01) {
+      creditorIndex += 1;
+    }
+  }
+
+  return settlements;
+}
+
 List<TravelTrip> _sortTripsByTime(List<TravelTrip> trips) {
   final sorted = [...trips];
   sorted.sort((a, b) {
@@ -1558,7 +1657,7 @@ class TripDetailView extends StatefulWidget {
 class _TripDetailViewState extends State<TripDetailView>
     with SingleTickerProviderStateMixin {
   late final TabController _tabController;
-  var _headerExpanded = true;
+  var _headerExpanded = false;
   var _lastTabIndex = 0;
 
   @override
@@ -1572,7 +1671,7 @@ class _TripDetailViewState extends State<TripDetailView>
   void didUpdateWidget(covariant TripDetailView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.trip.id != widget.trip.id) {
-      _headerExpanded = true;
+      _headerExpanded = false;
       _tabController.index = 0;
       _lastTabIndex = 0;
     }
@@ -1635,6 +1734,7 @@ class _TripDetailViewState extends State<TripDetailView>
               JournalTab(
                 trip: widget.trip,
                 onOpenEventActions: widget.onOpenEventActions,
+                onTripChanged: widget.onTripChanged,
               ),
               PlanTab(
                 trip: widget.trip,
@@ -2333,10 +2433,12 @@ class JournalTab extends StatefulWidget {
     super.key,
     required this.trip,
     required this.onOpenEventActions,
+    required this.onTripChanged,
   });
 
   final TravelTrip trip;
   final ValueChanged<TravelEvent> onOpenEventActions;
+  final ValueChanged<TravelTrip> onTripChanged;
 
   @override
   State<JournalTab> createState() => _JournalTabState();
@@ -2365,7 +2467,10 @@ class _JournalTabState extends State<JournalTab> {
   void _openExpenseDetails() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (context) => ExpenseDetailsPage(trip: widget.trip),
+        builder: (context) => ExpenseDetailsPage(
+          trip: widget.trip,
+          onTripChanged: widget.onTripChanged,
+        ),
       ),
     );
   }
@@ -2487,9 +2592,14 @@ class ExpenseSummaryCard extends StatelessWidget {
 }
 
 class ExpenseDetailsPage extends StatefulWidget {
-  const ExpenseDetailsPage({super.key, required this.trip});
+  const ExpenseDetailsPage({
+    super.key,
+    required this.trip,
+    required this.onTripChanged,
+  });
 
   final TravelTrip trip;
+  final ValueChanged<TravelTrip> onTripChanged;
 
   @override
   State<ExpenseDetailsPage> createState() => _ExpenseDetailsPageState();
@@ -2503,7 +2613,22 @@ class _ExpenseListItem {
 }
 
 class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
+  late TravelTrip _trip;
   String? _selectedMemberId;
+
+  @override
+  void initState() {
+    super.initState();
+    _trip = widget.trip;
+  }
+
+  @override
+  void didUpdateWidget(covariant ExpenseDetailsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.trip.id != widget.trip.id || oldWidget.trip != widget.trip) {
+      _trip = widget.trip;
+    }
+  }
 
   TravelMember? get _selectedMember {
     final selectedId = _selectedMemberId;
@@ -2511,7 +2636,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
       return null;
     }
 
-    for (final member in widget.trip.members) {
+    for (final member in _trip.members) {
       if (member.id == selectedId) {
         return member;
       }
@@ -2523,7 +2648,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
   List<_ExpenseListItem> get _expenseItems {
     final selectedId = _selectedMemberId;
     return [
-      for (final event in widget.trip.sortedEvents)
+      for (final event in _trip.sortedEvents)
         for (final expense in event.expenses)
           if (expense.amount > 0 &&
               (selectedId == null || expense.memberIds.contains(selectedId)))
@@ -2532,33 +2657,33 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
   }
 
   double _expenseMyrAmount(TravelExpense expense) {
-    final fullAmount = _expenseEntryAmountInMyr(widget.trip, expense);
+    final fullAmount = _expenseEntryAmountInMyr(_trip, expense);
     return _selectedMemberId == null
         ? fullAmount
         : fullAmount / max(1, expense.splitCount);
   }
 
   double _expenseTripAmount(TravelExpense expense) {
-    final targetRate = max(widget.trip.exchangeRateToMyr, 0.000001);
+    final targetRate = max(_trip.exchangeRateToMyr, 0.000001);
     return _expenseMyrAmount(expense) / targetRate;
   }
 
   double _expensePaidMyrAmount(TravelExpense expense) {
     return _expenseEntryPaidAmountInMyr(
-      widget.trip,
+      _trip,
       expense,
       memberId: _selectedMemberId,
     );
   }
 
   double _expensePaidTripAmount(TravelExpense expense) {
-    final targetRate = max(widget.trip.exchangeRateToMyr, 0.000001);
+    final targetRate = max(_trip.exchangeRateToMyr, 0.000001);
     return _expensePaidMyrAmount(expense) / targetRate;
   }
 
   String _expenseTripAmountLabel(TravelExpense expense) {
-    return '${_formatMoney(widget.trip.targetCurrency, _expenseTripAmount(expense))} '
-        '(paid ${_formatMoney(widget.trip.targetCurrency, _expensePaidTripAmount(expense))})';
+    return '${_formatMoney(_trip.targetCurrency, _expenseTripAmount(expense))} '
+        '(paid ${_formatMoney(_trip.targetCurrency, _expensePaidTripAmount(expense))})';
   }
 
   String _expenseMyrAmountLabel(TravelExpense expense) {
@@ -2572,14 +2697,8 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
   }
 
   List<Widget> _paymentStatusChips(TravelExpense expense) {
-    final payerLabels = _memberTagLabelsForIds(
-      widget.trip,
-      expense.payerMemberIds,
-    );
-    final paidLabels = _memberTagLabelsForIds(
-      widget.trip,
-      expense.paidMemberIds,
-    );
+    final payerLabels = _memberTagLabelsForIds(_trip, expense.payerMemberIds);
+    final paidLabels = _memberTagLabelsForIds(_trip, expense.paidMemberIds);
 
     return [
       for (final label in payerLabels)
@@ -2597,6 +2716,116 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
           visualDensity: VisualDensity.compact,
         ),
     ];
+  }
+
+  Color? _expenseCardColor(TravelExpense expense) {
+    final total = _expenseMyrAmount(expense);
+    final paid = _expensePaidMyrAmount(expense);
+    if (total <= 0 || paid <= 0) {
+      return null;
+    }
+
+    return paid >= total - 0.01
+        ? const Color(0xFFEAF8EF)
+        : const Color(0xFFFFF7D6);
+  }
+
+  List<_ExpenseSettlement> _visibleSettlements() {
+    final selectedMemberId = _selectedMemberId;
+    final settlements = _expenseSettlementsForTrip(_trip);
+    if (selectedMemberId == null) {
+      return settlements;
+    }
+
+    return [
+      for (final settlement in settlements)
+        if (settlement.debtor.id == selectedMemberId ||
+            settlement.creditor.id == selectedMemberId)
+          settlement,
+    ];
+  }
+
+  String _settlementAmountLabel(_ExpenseSettlement settlement) {
+    final targetRate = max(_trip.exchangeRateToMyr, 0.000001);
+    final targetAmount = settlement.amountMyr / targetRate;
+    return _formatMoney(_trip.targetCurrency, targetAmount);
+  }
+
+  Future<void> _editExpenseEvent(TravelEvent event) async {
+    final savedEvent = await showDialog<TravelEvent>(
+      context: context,
+      builder: (context) => EventFormDialog(
+        trip: _trip,
+        event: event,
+        mode: EventFormMode.expense,
+      ),
+    );
+    if (savedEvent == null || !mounted) {
+      return;
+    }
+
+    final events = [
+      for (final candidate in _trip.events)
+        if (candidate.id == savedEvent.id) savedEvent else candidate,
+    ];
+    final updatedTrip = _trip.copyWith(events: events);
+    setState(() => _trip = updatedTrip);
+    widget.onTripChanged(updatedTrip);
+  }
+
+  Widget _buildOwingSummary(TravelMember? selectedMember) {
+    final settlements = _visibleSettlements();
+    final emptyMessage = selectedMember == null
+        ? 'All tracked shares are paid.'
+        : 'No open balance for ${selectedMember.name}.';
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.swap_horiz_outlined),
+                const SizedBox(width: 8),
+                Text(
+                  'Owing summary',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            if (settlements.isEmpty)
+              Text(emptyMessage)
+            else
+              for (final settlement in settlements) ...[
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '${settlement.debtor.name} owes ${settlement.creditor.name}',
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      _settlementAmountLabel(settlement),
+                      style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ],
+                ),
+                if (settlement != settlements.last) const SizedBox(height: 8),
+              ],
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -2638,7 +2867,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                     selected: _selectedMemberId == null,
                     onSelected: (_) => setState(() => _selectedMemberId = null),
                   ),
-                  for (final member in widget.trip.members)
+                  for (final member in _trip.members)
                     ChoiceChip(
                       avatar: const Icon(Icons.person_outline, size: 18),
                       label: Text(member.name),
@@ -2664,7 +2893,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        '${_formatMoney(widget.trip.targetCurrency, totalTrip)} (paid ${_formatMoney(widget.trip.targetCurrency, totalPaidTrip)})',
+                        '${_formatMoney(_trip.targetCurrency, totalTrip)} (paid ${_formatMoney(_trip.targetCurrency, totalPaidTrip)})',
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: Theme.of(context).textTheme.headlineSmall
@@ -2682,6 +2911,8 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                 ),
               ),
               const SizedBox(height: 12),
+              _buildOwingSummary(selectedMember),
+              const SizedBox(height: 12),
               if (items.isEmpty)
                 Card(
                   child: Padding(
@@ -2696,105 +2927,118 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
               else
                 for (final item in items) ...[
                   Card(
-                    child: Padding(
-                      padding: const EdgeInsets.all(14),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      item.expense.title,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .titleMedium
-                                          ?.copyWith(
-                                            fontWeight: FontWeight.w700,
-                                          ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      '${item.event.title} - ${_dayFormatter.format(item.event.startAt)} - ${item.event.timeRangeLabel}',
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .bodySmall
-                                          ?.copyWith(
-                                            color: colors.onSurfaceVariant,
-                                          ),
-                                    ),
-                                  ],
+                    color: _expenseCardColor(item.expense),
+                    clipBehavior: Clip.antiAlias,
+                    child: InkWell(
+                      onTap: () => _editExpenseEvent(item.event),
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        item.expense.title,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .titleMedium
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        '${item.event.title} - ${_dayFormatter.format(item.event.startAt)} - ${item.event.timeRangeLabel}',
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .bodySmall
+                                            ?.copyWith(
+                                              color: colors.onSurfaceVariant,
+                                            ),
+                                      ),
+                                    ],
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(width: 8),
-                              Flexible(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.end,
-                                  children: [
-                                    Text(
-                                      _expenseTripAmountLabel(item.expense),
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      textAlign: TextAlign.right,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .titleMedium
-                                          ?.copyWith(
-                                            fontWeight: FontWeight.w800,
-                                          ),
-                                    ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      _expenseMyrAmountLabel(item.expense),
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      textAlign: TextAlign.right,
-                                      style: Theme.of(
-                                        context,
-                                      ).textTheme.bodySmall,
-                                    ),
-                                  ],
+                                const SizedBox(width: 8),
+                                Flexible(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.end,
+                                    children: [
+                                      Text(
+                                        _expenseTripAmountLabel(item.expense),
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        textAlign: TextAlign.right,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .titleMedium
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w800,
+                                            ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        _expenseMyrAmountLabel(item.expense),
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                        textAlign: TextAlign.right,
+                                        style: Theme.of(
+                                          context,
+                                        ).textTheme.bodySmall,
+                                      ),
+                                    ],
+                                  ),
                                 ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 10),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: [
-                              Chip(
-                                avatar: const Icon(
-                                  Icons.receipt_long_outlined,
-                                  size: 18,
+                                IconButton(
+                                  tooltip: 'Edit expense',
+                                  onPressed: () =>
+                                      _editExpenseEvent(item.event),
+                                  visualDensity: VisualDensity.compact,
+                                  icon: const Icon(Icons.edit_outlined),
                                 ),
-                                label: Text(
-                                  _expenseSourceAmountLabel(item.expense),
-                                ),
-                                visualDensity: VisualDensity.compact,
-                              ),
-                              for (final label in _memberTagLabelsForIds(
-                                widget.trip,
-                                item.expense.memberIds,
-                              ))
+                              ],
+                            ),
+                            const SizedBox(height: 10),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
                                 Chip(
-                                  avatar: Icon(
-                                    label == 'All'
-                                        ? Icons.groups_outlined
-                                        : Icons.person_outline,
+                                  avatar: const Icon(
+                                    Icons.receipt_long_outlined,
                                     size: 18,
                                   ),
-                                  label: Text(label),
+                                  label: Text(
+                                    _expenseSourceAmountLabel(item.expense),
+                                  ),
                                   visualDensity: VisualDensity.compact,
                                 ),
-                              ..._paymentStatusChips(item.expense),
-                            ],
-                          ),
-                        ],
+                                for (final label in _memberTagLabelsForIds(
+                                  _trip,
+                                  item.expense.memberIds,
+                                ))
+                                  Chip(
+                                    avatar: Icon(
+                                      label == 'All'
+                                          ? Icons.groups_outlined
+                                          : Icons.person_outline,
+                                      size: 18,
+                                    ),
+                                    label: Text(label),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                ..._paymentStatusChips(item.expense),
+                              ],
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
@@ -4995,7 +5239,7 @@ class _ExpenseFormRow {
       currencyCode: expense.currencyCode,
       splitCount: expense.splitCount,
       memberIds: expense.memberIds.toSet(),
-      payerMemberIds: expense.payerMemberIds.toSet(),
+      payerMemberIds: expense.payerMemberIds.take(1).toSet(),
       paidMemberIds: expense.paidMemberIds.toSet(),
       inputMode: ExpenseInputMode.total,
     );
@@ -5194,6 +5438,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
       final paidMemberIds = row.memberIds.isEmpty
           ? row.paidMemberIds
           : row.paidMemberIds.intersection(row.memberIds);
+      final payerMemberIds = row.payerMemberIds.take(1).toList();
       final amount = row.inputMode == ExpenseInputMode.perPerson
           ? enteredAmount * max(1, split)
           : enteredAmount;
@@ -5207,7 +5452,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
           currencyCode: _currencyForCode(row.currencyCode).code,
           splitCount: max(1, split),
           memberIds: row.memberIds.toList(),
-          payerMemberIds: row.payerMemberIds.toList(),
+          payerMemberIds: payerMemberIds,
           paidMemberIds: paidMemberIds.toList(),
         ),
       );
@@ -5390,10 +5635,15 @@ class _EventFormDialogState extends State<EventFormDialog> {
                         selectedColor: _expensePayerColor,
                         onSelected: (selected) {
                           setState(() {
+                            final previousPayerIds = {...row.payerMemberIds};
+                            row.payerMemberIds.clear();
+                            row.paidMemberIds.removeAll(previousPayerIds);
                             if (selected) {
                               row.payerMemberIds.add(member.id);
-                            } else {
-                              row.payerMemberIds.remove(member.id);
+                              if (row.memberIds.isEmpty ||
+                                  row.memberIds.contains(member.id)) {
+                                row.paidMemberIds.add(member.id);
+                              }
                             }
                           });
                         },
@@ -5425,6 +5675,9 @@ class _EventFormDialogState extends State<EventFormDialog> {
                           setState(() {
                             if (selected) {
                               row.memberIds.add(member.id);
+                              if (row.payerMemberIds.contains(member.id)) {
+                                row.paidMemberIds.add(member.id);
+                              }
                             } else {
                               row.memberIds.remove(member.id);
                               row.paidMemberIds.remove(member.id);
