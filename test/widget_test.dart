@@ -89,4 +89,136 @@ void main() {
     expect(find.text('Compact Phone Trip'), findsOneWidget);
     expect(find.textContaining('CNY 5,000.00'), findsWidgets);
   });
+
+  testWidgets('keeps owing summary tied to direct expense payers', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({
+      'traveler_trips_v1': '''
+[
+  {
+    "id": "trip-debts",
+    "name": "Pairwise Debt Trip",
+    "country": "Malaysia",
+    "targetCurrency": "CNY",
+    "exchangeRateToMyr": 1,
+    "startDate": "2026-05-25T00:00:00.000",
+    "endDate": "2026-05-26T00:00:00.000",
+    "members": [
+      {"id": "a", "name": "A"},
+      {"id": "b", "name": "B"},
+      {"id": "c", "name": "C"},
+      {"id": "d", "name": "D"},
+      {"id": "e", "name": "E"}
+    ],
+    "attachments": [],
+    "events": [
+      {
+        "id": "a-paid-b",
+        "title": "A paid for B",
+        "location": "",
+        "startAt": "2026-05-25T08:00:00.000",
+        "durationMinutes": 60,
+        "planNotes": "",
+        "journal": "",
+        "feeling": "",
+        "expenseAmount": 200,
+        "expenseCurrencyCode": "CNY",
+        "splitCount": 2,
+        "isFlexible": false,
+        "attachments": [],
+        "expenseMemberIds": ["a", "b"],
+        "expenses": [
+          {
+            "id": "expense-a-b",
+            "title": "A paid for B",
+            "amount": 200,
+            "currencyCode": "CNY",
+            "splitCount": 2,
+            "memberIds": ["a", "b"],
+            "payerMemberIds": ["a"],
+            "paidMemberIds": ["a"]
+          }
+        ]
+      },
+      {
+        "id": "a-paid-c",
+        "title": "A paid for C",
+        "location": "",
+        "startAt": "2026-05-25T10:00:00.000",
+        "durationMinutes": 60,
+        "planNotes": "",
+        "journal": "",
+        "feeling": "",
+        "expenseAmount": 600,
+        "expenseCurrencyCode": "CNY",
+        "splitCount": 2,
+        "isFlexible": false,
+        "attachments": [],
+        "expenseMemberIds": ["a", "c"],
+        "expenses": [
+          {
+            "id": "expense-a-c",
+            "title": "A paid for C",
+            "amount": 600,
+            "currencyCode": "CNY",
+            "splitCount": 2,
+            "memberIds": ["a", "c"],
+            "payerMemberIds": ["a"],
+            "paidMemberIds": ["a"]
+          }
+        ]
+      },
+      {
+        "id": "b-paid-all",
+        "title": "B paid group",
+        "location": "",
+        "startAt": "2026-05-25T12:00:00.000",
+        "durationMinutes": 60,
+        "planNotes": "",
+        "journal": "",
+        "feeling": "",
+        "expenseAmount": 200,
+        "expenseCurrencyCode": "CNY",
+        "splitCount": 5,
+        "isFlexible": false,
+        "attachments": [],
+        "expenseMemberIds": ["a", "b", "c", "d", "e"],
+        "expenses": [
+          {
+            "id": "expense-b-all",
+            "title": "B paid group",
+            "amount": 200,
+            "currencyCode": "CNY",
+            "splitCount": 5,
+            "memberIds": ["a", "b", "c", "d", "e"],
+            "payerMemberIds": ["b"],
+            "paidMemberIds": ["b"]
+          }
+        ]
+      }
+    ]
+  }
+]
+''',
+    });
+
+    await tester.pumpWidget(const TravelerApp());
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    await tester.tap(find.text('Pairwise Debt Trip'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    await tester.tap(find.text('Expenses').first);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(find.text('B owes A'), findsOneWidget);
+    expect(find.text('CNY 60.00'), findsOneWidget);
+    expect(find.text('C owes A'), findsOneWidget);
+    expect(find.text('C owes B'), findsOneWidget);
+    expect(find.text('D owes B'), findsOneWidget);
+    expect(find.text('E owes B'), findsOneWidget);
+    expect(find.text('CNY 340.00'), findsNothing);
+  });
 }

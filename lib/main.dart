@@ -335,13 +335,6 @@ String _paidShareStatusLabel(String label) {
   return label == 'All' ? 'All paid' : '$label paid';
 }
 
-class _MemberBalance {
-  _MemberBalance(this.member, this.amountMyr);
-
-  final TravelMember member;
-  double amountMyr;
-}
-
 class _ExpenseSettlement {
   const _ExpenseSettlement({
     required this.debtor,
@@ -356,7 +349,36 @@ class _ExpenseSettlement {
 
 List<_ExpenseSettlement> _expenseSettlementsForTrip(TravelTrip trip) {
   final memberById = {for (final member in trip.members) member.id: member};
-  final balances = {for (final member in trip.members) member.id: 0.0};
+  final memberOrder = {
+    for (var index = 0; index < trip.members.length; index++)
+      trip.members[index].id: index,
+  };
+  final debtsByDebtor = <String, Map<String, double>>{};
+
+  void addDebt(String debtorId, String creditorId, double amountMyr) {
+    if (amountMyr <= 0.01) {
+      return;
+    }
+
+    final debtsToCreditors = debtsByDebtor.putIfAbsent(
+      debtorId,
+      () => <String, double>{},
+    );
+    debtsToCreditors[creditorId] =
+        (debtsToCreditors[creditorId] ?? 0) + amountMyr;
+  }
+
+  void offsetReciprocalDebts(String firstId, String secondId) {
+    final firstOwesSecond = debtsByDebtor[firstId]?[secondId] ?? 0;
+    final secondOwesFirst = debtsByDebtor[secondId]?[firstId] ?? 0;
+    final offset = min(firstOwesSecond, secondOwesFirst);
+    if (offset <= 0.01) {
+      return;
+    }
+
+    debtsByDebtor[firstId]![secondId] = firstOwesSecond - offset;
+    debtsByDebtor[secondId]![firstId] = secondOwesFirst - offset;
+  }
 
   for (final event in trip.events) {
     for (final expense in event.expenses) {
@@ -387,49 +409,57 @@ List<_ExpenseSettlement> _expenseSettlementsForTrip(TravelTrip trip) {
           continue;
         }
 
-        balances[payerId] = (balances[payerId] ?? 0) + shareMyr;
-        balances[debtorId] = (balances[debtorId] ?? 0) - shareMyr;
+        addDebt(debtorId, payerId, shareMyr);
       }
     }
   }
 
-  final debtors = [
-    for (final entry in balances.entries)
-      if (entry.value < -0.01)
-        _MemberBalance(memberById[entry.key]!, -entry.value),
-  ]..sort((a, b) => a.member.name.compareTo(b.member.name));
-  final creditors = [
-    for (final entry in balances.entries)
-      if (entry.value > 0.01)
-        _MemberBalance(memberById[entry.key]!, entry.value),
-  ]..sort((a, b) => a.member.name.compareTo(b.member.name));
+  final memberIds = memberById.keys.toList();
+  for (var firstIndex = 0; firstIndex < memberIds.length; firstIndex++) {
+    for (
+      var secondIndex = firstIndex + 1;
+      secondIndex < memberIds.length;
+      secondIndex++
+    ) {
+      offsetReciprocalDebts(memberIds[firstIndex], memberIds[secondIndex]);
+    }
+  }
 
   final settlements = <_ExpenseSettlement>[];
-  var debtorIndex = 0;
-  var creditorIndex = 0;
-  while (debtorIndex < debtors.length && creditorIndex < creditors.length) {
-    final debtor = debtors[debtorIndex];
-    final creditor = creditors[creditorIndex];
-    final amountMyr = min(debtor.amountMyr, creditor.amountMyr);
-    if (amountMyr > 0.01) {
+  for (final debtorEntry in debtsByDebtor.entries) {
+    final debtor = memberById[debtorEntry.key];
+    if (debtor == null) {
+      continue;
+    }
+
+    for (final creditorEntry in debtorEntry.value.entries) {
+      final creditor = memberById[creditorEntry.key];
+      if (creditor == null || creditorEntry.value <= 0.01) {
+        continue;
+      }
+
       settlements.add(
         _ExpenseSettlement(
-          debtor: debtor.member,
-          creditor: creditor.member,
-          amountMyr: amountMyr,
+          debtor: debtor,
+          creditor: creditor,
+          amountMyr: creditorEntry.value,
         ),
       );
     }
-
-    debtor.amountMyr -= amountMyr;
-    creditor.amountMyr -= amountMyr;
-    if (debtor.amountMyr <= 0.01) {
-      debtorIndex += 1;
-    }
-    if (creditor.amountMyr <= 0.01) {
-      creditorIndex += 1;
-    }
   }
+
+  settlements.sort((a, b) {
+    final debtorOrder = (memberOrder[a.debtor.id] ?? 9999).compareTo(
+      memberOrder[b.debtor.id] ?? 9999,
+    );
+    if (debtorOrder != 0) {
+      return debtorOrder;
+    }
+
+    return (memberOrder[a.creditor.id] ?? 9999).compareTo(
+      memberOrder[b.creditor.id] ?? 9999,
+    );
+  });
 
   return settlements;
 }
