@@ -565,11 +565,10 @@ String _buildTripShareText(TravelTrip trip) {
       final perPerson = expense.splitCount <= 1
           ? expense.amount
           : expense.amount / expense.splitCount;
-      final paidAmount = _expenseEntryPaidAmount(expense);
       buffer.writeln(
         [
           'Expense: ${expense.title}',
-          '${_formatMoney(expense.currencyCode, expense.amount)} (paid ${_formatMoney(expense.currencyCode, paidAmount)})',
+          _formatMoney(expense.currencyCode, expense.amount),
           if (expense.splitCount > 1)
             '${_formatMoney(expense.currencyCode, perPerson)} each',
           if (members.isNotEmpty) members.join(', '),
@@ -2563,8 +2562,6 @@ class ExpenseSummaryCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final totalTarget = trip.totalExpenseInTripCurrency;
     final totalMyr = trip.totalExpenseInMyr;
-    final paidTarget = trip.totalPaidExpenseInTripCurrency;
-    final paidMyr = trip.totalPaidExpenseInMyr;
 
     return Card(
       color: const Color(0xFFFFF4E8),
@@ -2594,7 +2591,7 @@ class ExpenseSummaryCard extends StatelessWidget {
                         ),
                         const SizedBox(height: 4),
                         Text(
-                          '${_formatMoney(trip.targetCurrency, totalTarget)} (paid ${_formatMoney(trip.targetCurrency, paidTarget)})',
+                          _formatMoney(trip.targetCurrency, totalTarget),
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
                           style: Theme.of(context).textTheme.headlineSmall
@@ -2608,7 +2605,7 @@ class ExpenseSummaryCard extends StatelessWidget {
                 ],
               ),
               Text(
-                'MYR ${_moneyFormatter.format(totalMyr)} (paid ${_moneyFormatter.format(paidMyr)})',
+                'MYR ${_moneyFormatter.format(totalMyr)}',
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: Theme.of(context).textTheme.titleMedium,
@@ -2645,6 +2642,7 @@ class _ExpenseListItem {
 class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
   late TravelTrip _trip;
   String? _selectedMemberId;
+  bool _isOwingSummaryExpanded = false;
 
   @override
   void initState() {
@@ -2681,7 +2679,10 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
       for (final event in _trip.sortedEvents)
         for (final expense in event.expenses)
           if (expense.amount > 0 &&
-              (selectedId == null || expense.memberIds.contains(selectedId)))
+              (selectedId == null ||
+                  expense.memberIds.contains(selectedId) ||
+                  expense.payerMemberIds.contains(selectedId) ||
+                  expense.paidMemberIds.contains(selectedId)))
             _ExpenseListItem(event: event, expense: expense),
     ];
   }
@@ -2706,24 +2707,16 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
     );
   }
 
-  double _expensePaidTripAmount(TravelExpense expense) {
-    final targetRate = max(_trip.exchangeRateToMyr, 0.000001);
-    return _expensePaidMyrAmount(expense) / targetRate;
-  }
-
   String _expenseTripAmountLabel(TravelExpense expense) {
-    return '${_formatMoney(_trip.targetCurrency, _expenseTripAmount(expense))} '
-        '(paid ${_formatMoney(_trip.targetCurrency, _expensePaidTripAmount(expense))})';
+    return _formatMoney(_trip.targetCurrency, _expenseTripAmount(expense));
   }
 
   String _expenseMyrAmountLabel(TravelExpense expense) {
-    return 'MYR ${_moneyFormatter.format(_expenseMyrAmount(expense))} '
-        '(paid ${_moneyFormatter.format(_expensePaidMyrAmount(expense))})';
+    return 'MYR ${_moneyFormatter.format(_expenseMyrAmount(expense))}';
   }
 
   String _expenseSourceAmountLabel(TravelExpense expense) {
-    return '${_formatMoney(expense.currencyCode, expense.amount)} '
-        '(paid ${_formatMoney(expense.currencyCode, _expenseEntryPaidAmount(expense))})';
+    return _formatMoney(expense.currencyCode, expense.amount);
   }
 
   List<Widget> _paymentStatusChips(TravelExpense expense) {
@@ -2760,24 +2753,9 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
         : const Color(0xFFFFF7D6);
   }
 
-  List<_ExpenseSettlement> _visibleSettlements() {
-    final selectedMemberId = _selectedMemberId;
-    final settlements = _expenseSettlementsForTrip(_trip);
-    if (selectedMemberId == null) {
-      return settlements;
-    }
-
-    return [
-      for (final settlement in settlements)
-        if (settlement.debtor.id == selectedMemberId ||
-            settlement.creditor.id == selectedMemberId)
-          settlement,
-    ];
-  }
-
-  String _settlementAmountLabel(_ExpenseSettlement settlement) {
+  String _settlementAmountLabel(double amountMyr) {
     final targetRate = max(_trip.exchangeRateToMyr, 0.000001);
-    final targetAmount = settlement.amountMyr / targetRate;
+    final targetAmount = amountMyr / targetRate;
     return _formatMoney(_trip.targetCurrency, targetAmount);
   }
 
@@ -2804,10 +2782,20 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
   }
 
   Widget _buildOwingSummary(TravelMember? selectedMember) {
-    final settlements = _visibleSettlements();
+    final settlements = _expenseSettlementsForTrip(_trip);
     final emptyMessage = selectedMember == null
         ? 'All tracked shares are paid.'
         : 'No open balance for ${selectedMember.name}.';
+    final groupedMembers = [
+      if (selectedMember == null) ...[
+        for (final member in _trip.members)
+          if (_settlementsForMember(settlements, member).isNotEmpty) member,
+      ] else if (_settlementsForMember(settlements, selectedMember).isNotEmpty)
+        selectedMember,
+    ];
+    final canToggleAllSummary =
+        selectedMember == null && groupedMembers.isNotEmpty;
+    final isSummaryExpanded = selectedMember != null || _isOwingSummaryExpanded;
 
     return Card(
       child: Padding(
@@ -2819,42 +2807,260 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
               children: [
                 const Icon(Icons.swap_horiz_outlined),
                 const SizedBox(width: 8),
-                Text(
-                  'Owing summary',
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w700,
+                Expanded(
+                  child: Text(
+                    'Owing summary',
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
+                if (selectedMember != null)
+                  _buildSettlementMemberChip(selectedMember),
+                if (canToggleAllSummary)
+                  TextButton.icon(
+                    onPressed: () {
+                      setState(
+                        () =>
+                            _isOwingSummaryExpanded = !_isOwingSummaryExpanded,
+                      );
+                    },
+                    icon: Icon(
+                      isSummaryExpanded
+                          ? Icons.keyboard_arrow_up
+                          : Icons.keyboard_arrow_down,
+                    ),
+                    label: Text(isSummaryExpanded ? 'Collapse' : 'Expand'),
+                  ),
               ],
             ),
-            const SizedBox(height: 10),
-            if (settlements.isEmpty)
+            if (canToggleAllSummary && !isSummaryExpanded) ...[
+              const SizedBox(height: 10),
+              Text('${groupedMembers.length} members with open balances.'),
+            ],
+            if (groupedMembers.isEmpty || isSummaryExpanded)
+              const SizedBox(height: 10),
+            if (groupedMembers.isEmpty)
               Text(emptyMessage)
-            else
-              for (final settlement in settlements) ...[
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        '${settlement.debtor.name} owes ${settlement.creditor.name}',
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      _settlementAmountLabel(settlement),
-                      style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                  ],
+            else if (isSummaryExpanded)
+              for (final member in groupedMembers) ...[
+                _buildMemberSettlementGroup(
+                  member: member,
+                  settlements: _settlementsForMember(settlements, member),
+                  showHeader: selectedMember == null,
                 ),
-                if (settlement != settlements.last) const SizedBox(height: 8),
+                if (member != groupedMembers.last) const SizedBox(height: 14),
               ],
           ],
         ),
       ),
+    );
+  }
+
+  List<_ExpenseSettlement> _settlementsForMember(
+    List<_ExpenseSettlement> settlements,
+    TravelMember member,
+  ) {
+    return [
+      for (final settlement in settlements)
+        if (settlement.debtor.id == member.id ||
+            settlement.creditor.id == member.id)
+          settlement,
+    ];
+  }
+
+  double _memberReceiveTotal(
+    List<_ExpenseSettlement> settlements,
+    TravelMember member,
+  ) {
+    return settlements.fold<double>(
+      0,
+      (total, settlement) => settlement.creditor.id == member.id
+          ? total + settlement.amountMyr
+          : total,
+    );
+  }
+
+  double _memberPayTotal(
+    List<_ExpenseSettlement> settlements,
+    TravelMember member,
+  ) {
+    return settlements.fold<double>(
+      0,
+      (total, settlement) => settlement.debtor.id == member.id
+          ? total + settlement.amountMyr
+          : total,
+    );
+  }
+
+  Widget _buildMemberSettlementGroup({
+    required TravelMember member,
+    required List<_ExpenseSettlement> settlements,
+    required bool showHeader,
+  }) {
+    final receiveSettlements = [
+      for (final settlement in settlements)
+        if (settlement.creditor.id == member.id) settlement,
+    ];
+    final paySettlements = [
+      for (final settlement in settlements)
+        if (settlement.debtor.id == member.id) settlement,
+    ];
+    final receiveTotal = _memberReceiveTotal(settlements, member);
+    final payTotal = _memberPayTotal(settlements, member);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (showHeader) ...[
+          Align(
+            alignment: Alignment.center,
+            child: _buildSettlementMemberChip(member),
+          ),
+          const SizedBox(height: 10),
+        ],
+        if (receiveSettlements.isNotEmpty)
+          _buildSettlementDirectionSection(
+            title: 'To receive',
+            settlements: receiveSettlements,
+            totalMyr: receiveTotal,
+            positive: true,
+            otherMemberForSettlement: (settlement) => settlement.debtor,
+          ),
+        if (receiveSettlements.isNotEmpty && paySettlements.isNotEmpty)
+          const SizedBox(height: 12),
+        if (paySettlements.isNotEmpty)
+          _buildSettlementDirectionSection(
+            title: 'To pay',
+            settlements: paySettlements,
+            totalMyr: payTotal,
+            positive: false,
+            otherMemberForSettlement: (settlement) => settlement.creditor,
+          ),
+      ],
+    );
+  }
+
+  Widget _buildSettlementDirectionSection({
+    required String title,
+    required List<_ExpenseSettlement> settlements,
+    required double totalMyr,
+    required bool positive,
+    required TravelMember Function(_ExpenseSettlement settlement)
+    otherMemberForSettlement,
+  }) {
+    final titleColor = positive
+        ? const Color(0xFF166534)
+        : const Color(0xFF7A5600);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              positive ? Icons.call_received : Icons.call_made,
+              size: 16,
+              color: titleColor,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              title,
+              style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                color: titleColor,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        for (final settlement in settlements) ...[
+          _buildPerspectiveSettlementRow(
+            otherMember: otherMemberForSettlement(settlement),
+            amountMyr: settlement.amountMyr,
+            positive: positive,
+          ),
+          if (settlement != settlements.last) const SizedBox(height: 8),
+        ],
+        const SizedBox(height: 8),
+        Align(
+          alignment: Alignment.centerRight,
+          child: _buildSignedAmountBadge(
+            totalMyr,
+            positive: positive,
+            label: title,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPerspectiveSettlementRow({
+    required TravelMember otherMember,
+    required double amountMyr,
+    required bool positive,
+  }) {
+    return Row(
+      children: [
+        _buildSettlementMemberChip(otherMember),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Divider(color: Theme.of(context).colorScheme.outlineVariant),
+        ),
+        const SizedBox(width: 8),
+        _buildSignedAmountBadge(amountMyr, positive: positive),
+      ],
+    );
+  }
+
+  Widget _buildSignedAmountBadge(
+    double amountMyr, {
+    required bool positive,
+    String? label,
+  }) {
+    final backgroundColor = positive
+        ? const Color(0xFFDCFCE7)
+        : const Color(0xFFFFE9A8);
+    final textColor = positive
+        ? const Color(0xFF166534)
+        : const Color(0xFF7A5600);
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: backgroundColor,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+        child: Text(
+          [?label, _settlementAmountLabel(amountMyr)].join(' '),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: Theme.of(context).textTheme.labelLarge?.copyWith(
+            color: textColor,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSettlementMemberChip(TravelMember member) {
+    final selected = _selectedMemberId == member.id;
+
+    return ActionChip(
+      avatar: const Icon(Icons.person_outline, size: 18),
+      label: Text(member.name),
+      backgroundColor: selected
+          ? Theme.of(context).colorScheme.primaryContainer
+          : null,
+      onPressed: () {
+        setState(() {
+          _selectedMemberId = selected ? null : member.id;
+        });
+      },
+      visualDensity: VisualDensity.compact,
     );
   }
 
@@ -2866,17 +3072,9 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
       0,
       (total, item) => total + _expenseMyrAmount(item.expense),
     );
-    final totalPaidMyr = items.fold<double>(
-      0,
-      (total, item) => total + _expensePaidMyrAmount(item.expense),
-    );
     final totalTrip = items.fold<double>(
       0,
       (total, item) => total + _expenseTripAmount(item.expense),
-    );
-    final totalPaidTrip = items.fold<double>(
-      0,
-      (total, item) => total + _expensePaidTripAmount(item.expense),
     );
     final colors = Theme.of(context).colorScheme;
 
@@ -2902,8 +3100,11 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                       avatar: const Icon(Icons.person_outline, size: 18),
                       label: Text(member.name),
                       selected: _selectedMemberId == member.id,
-                      onSelected: (_) =>
-                          setState(() => _selectedMemberId = member.id),
+                      onSelected: (_) => setState(() {
+                        _selectedMemberId = _selectedMemberId == member.id
+                            ? null
+                            : member.id;
+                      }),
                     ),
                 ],
               ),
@@ -2923,7 +3124,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        '${_formatMoney(_trip.targetCurrency, totalTrip)} (paid ${_formatMoney(_trip.targetCurrency, totalPaidTrip)})',
+                        _formatMoney(_trip.targetCurrency, totalTrip),
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: Theme.of(context).textTheme.headlineSmall
@@ -2931,7 +3132,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                       ),
                       const SizedBox(height: 4),
                       Text(
-                        'MYR ${_moneyFormatter.format(totalMyr)} (paid ${_moneyFormatter.format(totalPaidMyr)})',
+                        'MYR ${_moneyFormatter.format(totalMyr)}',
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: Theme.of(context).textTheme.bodyMedium,
@@ -3259,7 +3460,6 @@ class JournalBillPanel extends StatelessWidget {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
     final totalTrip = _expenseAmountInTripCurrency(trip, event);
-    final paidTrip = _expensePaidAmountInTripCurrency(trip, event);
 
     return Container(
       width: double.infinity,
@@ -3275,7 +3475,7 @@ class JournalBillPanel extends StatelessWidget {
           Align(
             alignment: Alignment.centerRight,
             child: Text(
-              '${_formatMoney(trip.targetCurrency, totalTrip)} (paid ${_formatMoney(trip.targetCurrency, paidTrip)})',
+              _formatMoney(trip.targetCurrency, totalTrip),
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
               textAlign: TextAlign.right,
@@ -3307,7 +3507,6 @@ class _JournalExpenseLine extends StatelessWidget {
     final labels = _memberTagLabelsForIds(trip, expense.memberIds);
     final payerLabels = _memberTagLabelsForIds(trip, expense.payerMemberIds);
     final paidLabels = _memberTagLabelsForIds(trip, expense.paidMemberIds);
-    final paidAmount = _expenseEntryPaidAmount(expense);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -3326,7 +3525,7 @@ class _JournalExpenseLine extends StatelessWidget {
             const SizedBox(width: 8),
             Flexible(
               child: Text(
-                '${_formatMoney(expense.currencyCode, expense.amount)} (paid ${_formatMoney(expense.currencyCode, paidAmount)})',
+                _formatMoney(expense.currencyCode, expense.amount),
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 textAlign: TextAlign.right,

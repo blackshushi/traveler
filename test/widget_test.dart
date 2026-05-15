@@ -213,12 +213,27 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 250));
 
-    expect(find.text('B owes A'), findsOneWidget);
-    expect(find.text('CNY 60.00'), findsOneWidget);
-    expect(find.text('C owes A'), findsOneWidget);
-    expect(find.text('C owes B'), findsOneWidget);
-    expect(find.text('D owes B'), findsOneWidget);
-    expect(find.text('E owes B'), findsOneWidget);
-    expect(find.text('CNY 340.00'), findsNothing);
+    expect(find.text('B owes A'), findsNothing);
+    expect(find.text('Expand'), findsOneWidget);
+    expect(find.text('5 members with open balances.'), findsOneWidget);
+    expect(find.text('To receive CNY 360.00'), findsNothing);
+
+    await tester.tap(find.text('Expand'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+
+    expect(find.text('Collapse'), findsOneWidget);
+    expect(find.text('To receive'), findsWidgets);
+    expect(find.text('To pay'), findsWidgets);
+    expect(
+      tester.getTopLeft(find.text('To receive').first).dy,
+      lessThan(tester.getTopLeft(find.text('To pay').first).dy),
+    );
+    expect(find.text('To receive CNY 360.00'), findsOneWidget);
+    expect(find.text('To pay CNY 340.00'), findsOneWidget);
+    expect(find.text('+CNY 60.00'), findsNothing);
+    expect(find.text('-CNY 60.00'), findsNothing);
+    expect(find.text('CNY 60.00'), findsNWidgets(2));
+    expect(find.text('CNY 300.00'), findsNWidgets(2));
   });
 }
