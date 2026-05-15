@@ -1,5 +1,6 @@
 import 'dart:ui';
 
+import 'package:flutter/material.dart' show Card, ChoiceChip, Text;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:traveler/main.dart';
@@ -231,9 +232,27 @@ void main() {
     );
     expect(find.text('To receive CNY 360.00'), findsOneWidget);
     expect(find.text('To pay CNY 340.00'), findsOneWidget);
+    expect(find.text('MYR 360.00'), findsOneWidget);
+    expect(find.text('MYR 340.00'), findsOneWidget);
     expect(find.text('+CNY 60.00'), findsNothing);
     expect(find.text('-CNY 60.00'), findsNothing);
     expect(find.text('CNY 60.00'), findsNWidgets(2));
     expect(find.text('CNY 300.00'), findsNWidgets(2));
+
+    final memberAFilter = find.byWidgetPredicate((widget) {
+      return widget is ChoiceChip &&
+          widget.label is Text &&
+          (widget.label as Text).data == 'A';
+    });
+    await tester.tap(memberAFilter);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+
+    final aPaidCard = tester.widget<Card>(
+      find
+          .ancestor(of: find.text('A paid for B'), matching: find.byType(Card))
+          .first,
+    );
+    expect(aPaidCard.color, const Color(0xFFFFF7D6));
   });
 }

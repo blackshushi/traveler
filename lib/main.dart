@@ -2742,6 +2742,20 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
   }
 
   Color? _expenseCardColor(TravelExpense expense) {
+    final selectedMemberId = _selectedMemberId;
+    if (selectedMemberId != null &&
+        expense.payerMemberIds.contains(selectedMemberId)) {
+      final total = _expenseEntryAmountInMyr(_trip, expense);
+      final paid = _expenseEntryPaidAmountInMyr(_trip, expense);
+      if (total <= 0 || paid <= 0) {
+        return null;
+      }
+
+      return paid >= total - 0.01
+          ? const Color(0xFFEAF8EF)
+          : const Color(0xFFFFF7D6);
+    }
+
     final total = _expenseMyrAmount(expense);
     final paid = _expensePaidMyrAmount(expense);
     if (total <= 0 || paid <= 0) {
@@ -2757,6 +2771,14 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
     final targetRate = max(_trip.exchangeRateToMyr, 0.000001);
     final targetAmount = amountMyr / targetRate;
     return _formatMoney(_trip.targetCurrency, targetAmount);
+  }
+
+  String? _settlementConvertedAmountLabel(double amountMyr) {
+    if (_trip.targetCurrency.toUpperCase() == 'MYR') {
+      return null;
+    }
+
+    return 'MYR ${_moneyFormatter.format(amountMyr)}';
   }
 
   Future<void> _editExpenseEvent(TravelEvent event) async {
@@ -3025,6 +3047,7 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
     final textColor = positive
         ? const Color(0xFF166534)
         : const Color(0xFF7A5600);
+    final convertedLabel = _settlementConvertedAmountLabel(amountMyr);
 
     return DecoratedBox(
       decoration: BoxDecoration(
@@ -3033,13 +3056,34 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
       ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-        child: Text(
-          [?label, _settlementAmountLabel(amountMyr)].join(' '),
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: Theme.of(context).textTheme.labelLarge?.copyWith(
-            color: textColor,
-            fontWeight: FontWeight.w800,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 180),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                [?label, _settlementAmountLabel(amountMyr)].join(' '),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.right,
+                style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                  color: textColor,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              if (convertedLabel != null)
+                Text(
+                  convertedLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.right,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: textColor,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+            ],
           ),
         ),
       ),
