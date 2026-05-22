@@ -12,6 +12,7 @@ import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import 'attachment_storage.dart';
 import 'clipboard_writer.dart';
 
 void main() {
@@ -1030,10 +1031,21 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
       return null;
     }
 
-    final attachment = TravelAttachment(
-      id: _newId('file'),
+    final attachmentId = _newId('file');
+    final durablePath = await saveAttachmentCopy(
+      id: attachmentId,
       name: file.name,
-      path: file.path,
+      bytes: bytes,
+    );
+
+    if (!kIsWeb && durablePath == null && mounted) {
+      _showSnack('File attached, but could not create the Files folder copy.');
+    }
+
+    final attachment = TravelAttachment(
+      id: attachmentId,
+      name: file.name,
+      path: durablePath ?? file.path,
       bytesBase64: base64Encode(bytes),
       mimeType: file.extension == null ? null : _guessMimeType(file.extension),
       kind: AttachmentKind.file,
@@ -1088,10 +1100,23 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
         }
       }
 
-      final attachment = TravelAttachment(
-        id: _newId('photo'),
+      final attachmentId = _newId('photo');
+      final durablePath = await saveAttachmentCopy(
+        id: attachmentId,
         name: photo.name,
-        path: kIsWeb ? null : photo.path,
+        bytes: bytes,
+      );
+
+      if (!kIsWeb && durablePath == null && mounted) {
+        _showSnack(
+          'Photo attached, but could not create the Files folder copy.',
+        );
+      }
+
+      final attachment = TravelAttachment(
+        id: attachmentId,
+        name: photo.name,
+        path: durablePath ?? (kIsWeb ? null : photo.path),
         bytesBase64: base64Encode(bytes),
         mimeType: photo.mimeType ?? _guessMimeType(photo.name.split('.').last),
         kind: AttachmentKind.photo,
@@ -1221,35 +1246,89 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     );
   }
 
+  Future<void> _replaceAttachment(TravelAttachment attachment) async {
+    List<TravelAttachment> replaceAttachments(
+      List<TravelAttachment> attachments,
+    ) {
+      return [
+        for (final candidate in attachments)
+          if (candidate.id == attachment.id) attachment else candidate,
+      ];
+    }
+
+    final nextTrips = [
+      for (final trip in _trips)
+        trip.copyWith(
+          attachments: replaceAttachments(trip.attachments),
+          events: [
+            for (final event in trip.events)
+              event.copyWith(
+                attachments: replaceAttachments(event.attachments),
+              ),
+          ],
+        ),
+    ];
+
+    await _persistTrips(nextTrips);
+  }
+
+  Future<TravelAttachment> _ensureAttachmentPath(
+    TravelAttachment attachment,
+  ) async {
+    if (await attachmentPathExists(attachment.path)) {
+      return attachment;
+    }
+
+    final bytes = _attachmentBytes(attachment);
+    if (bytes == null) {
+      return attachment;
+    }
+
+    final durablePath = await saveAttachmentCopy(
+      id: attachment.id,
+      name: attachment.name,
+      bytes: bytes,
+    );
+    if (durablePath == null) {
+      return attachment;
+    }
+
+    final updatedAttachment = attachment.copyWith(path: durablePath);
+    await _replaceAttachment(updatedAttachment);
+    return updatedAttachment;
+  }
+
   Future<void> _shareAttachment(TravelAttachment attachment) async {
     try {
-      final bytes = _attachmentBytes(attachment);
-      final path = attachment.path;
-      if (bytes == null && (path == null || path.isEmpty)) {
+      final shareAttachment = await _ensureAttachmentPath(attachment);
+      final path = shareAttachment.path;
+      final pathExists = await attachmentPathExists(path);
+      final bytes = _attachmentBytes(shareAttachment);
+      if (bytes == null && !pathExists) {
         _showSnack('This attachment is not available to share.');
         return;
       }
 
-      final file = bytes != null
-          ? XFile.fromData(
-              bytes,
-              mimeType: attachment.mimeType,
-              name: attachment.name,
-              length: attachment.sizeBytes,
-            )
-          : XFile(
+      final file = pathExists
+          ? XFile(
               path!,
-              mimeType: attachment.mimeType,
-              name: attachment.name,
-              length: attachment.sizeBytes,
+              mimeType: shareAttachment.mimeType,
+              name: shareAttachment.name,
+              length: shareAttachment.sizeBytes,
+            )
+          : XFile.fromData(
+              bytes!,
+              mimeType: shareAttachment.mimeType,
+              name: shareAttachment.name,
+              length: shareAttachment.sizeBytes,
             );
 
       await SharePlus.instance.share(
         ShareParams(
-          title: attachment.name,
-          subject: attachment.name,
+          title: shareAttachment.name,
+          subject: shareAttachment.name,
           files: [file],
-          fileNameOverrides: [attachment.name],
+          fileNameOverrides: [shareAttachment.name],
           downloadFallbackEnabled: true,
         ),
       );
@@ -6735,11 +6814,11 @@ class TravelAttachment {
   final DateTime addedAt;
   final List<String> memberIds;
 
-  TravelAttachment copyWith({List<String>? memberIds}) {
+  TravelAttachment copyWith({String? path, List<String>? memberIds}) {
     return TravelAttachment(
       id: id,
       name: name,
-      path: path,
+      path: path ?? this.path,
       bytesBase64: bytesBase64,
       mimeType: mimeType,
       kind: kind,
