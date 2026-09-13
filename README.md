@@ -1,11 +1,13 @@
 # Traveler
 
-Traveler is a personal Flutter travel planner for Android and iOS. It keeps trips isolated so each destination has its own plan, journal, expenses, currency converter, and attachments.
+Traveler is a personal Flutter travel companion for Android and iOS. It keeps trips isolated so each destination has its own activities, journal, expenses, currency converter, and attachments. You can plan ahead or start recording a trip as it happens.
 
 ## Features
 
 - Create separate trips with destination, dates, target currency, and MYR exchange rate.
-- Add timeline events with date, time, duration, location, plan notes, and flexible timing.
+- Add an activity or a standalone expense from the trip timeline; no itinerary is required first.
+- Keep long activity, journal, and expense lists compact, then expand an item when its details are needed.
+- Add activities with date, time, duration, location, notes, and flexible timing.
 - Record experience notes, feelings, expenses, and split counts per event.
 - Convert between the trip currency and MYR using a per-trip saved rate.
 - Attach local files such as tickets, documents, and plans for quick access.

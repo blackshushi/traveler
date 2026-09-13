@@ -1,6 +1,7 @@
 import 'dart:ui';
 
-import 'package:flutter/material.dart' show Card, ChoiceChip, Text;
+import 'package:flutter/material.dart'
+    show Card, ChoiceChip, Text, TextFormField, ValueKey;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:traveler/main.dart';
@@ -254,5 +255,134 @@ void main() {
           .first,
     );
     expect(aPaidCard.color, const Color(0xFFFFF7D6));
+  });
+
+  testWidgets('creates a standalone expense without an activity', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({
+      'traveler_trips_v1': '''
+[
+  {
+    "id": "trip-flexible",
+    "name": "Flexible Trip",
+    "country": "Japan",
+    "targetCurrency": "JPY",
+    "exchangeRateToMyr": 0.03,
+    "startDate": null,
+    "endDate": null,
+    "members": [],
+    "attachments": [],
+    "events": []
+  }
+]
+''',
+    });
+
+    await tester.pumpWidget(const TravelerApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Flexible Trip'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Trip'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Add activity or expense'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Activity'), findsOneWidget);
+    expect(find.text('Expense'), findsOneWidget);
+
+    await tester.tap(find.text('Expense'));
+    await tester.pumpAndSettle();
+    expect(find.text('New expense'), findsOneWidget);
+    expect(find.textContaining('At '), findsOneWidget);
+
+    await tester.enterText(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextFormField && widget.decoration?.labelText == 'Usage',
+      ),
+      'Train fare',
+    );
+    await tester.enterText(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is TextFormField &&
+            widget.decoration?.labelText == 'Total JPY',
+      ),
+      '1200',
+    );
+    await tester.tap(find.text('Save'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Train fare'), findsOneWidget);
+    expect(find.text('JPY 1,200.00'), findsOneWidget);
+
+    final preferences = await SharedPreferences.getInstance();
+    final saved = preferences.getString('traveler_trips_v1')!;
+    expect(saved, contains('"itemType":"expense"'));
+    expect(saved, contains('"title":"Train fare"'));
+  });
+
+  testWidgets('keeps activity details collapsed until requested', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({
+      'traveler_trips_v1': '''
+[
+  {
+    "id": "trip-compact",
+    "name": "Compact Items",
+    "country": "Japan",
+    "targetCurrency": "JPY",
+    "exchangeRateToMyr": 0.03,
+    "startDate": null,
+    "endDate": null,
+    "members": [],
+    "attachments": [],
+    "events": [
+      {
+        "id": "activity-long",
+        "itemType": "activity",
+        "title": "Visit the old town",
+        "location": "Kyoto",
+        "startAt": "2026-09-13T10:00:00.000",
+        "durationMinutes": 120,
+        "planNotes": "This detail stays hidden while the timeline is compact.",
+        "journal": "",
+        "feeling": "",
+        "expenseAmount": 0,
+        "expenseCurrencyCode": "JPY",
+        "splitCount": 1,
+        "isFlexible": false,
+        "attachments": [],
+        "expenseMemberIds": [],
+        "expenses": [],
+        "planMemberIds": []
+      }
+    ]
+  }
+]
+''',
+    });
+
+    await tester.pumpWidget(const TravelerApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Compact Items'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Trip'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('This detail stays hidden while the timeline is compact.'),
+      findsNothing,
+    );
+
+    await tester.tap(find.byKey(const ValueKey('timeline_expand_activity-long')));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('This detail stays hidden while the timeline is compact.'),
+      findsOneWidget,
+    );
   });
 }
