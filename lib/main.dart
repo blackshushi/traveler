@@ -68,6 +68,10 @@ enum EventAction { plan, experience, expense, files, delete }
 
 enum EventFormMode { plan, experience, expense }
 
+enum CreateItemAction { activity, expense }
+
+enum TripItemType { activity, expense }
+
 enum ExpenseInputMode { total, perPerson }
 
 enum AttachmentKind { file, photo }
@@ -545,7 +549,10 @@ String _buildTripShareText(TravelTrip trip) {
       currentDay = eventDay;
     }
 
-    buffer.writeln('${event.timeRangeLabel}  |  ${event.title}');
+    final timeLabel = event.itemType == TripItemType.expense
+        ? _timeFormatter.format(event.startAt)
+        : event.timeRangeLabel;
+    buffer.writeln('$timeLabel  |  ${event.title}');
     final planMembers = _memberTagLabelsForIds(trip, event.planMemberIds);
     if (planMembers.isNotEmpty) {
       buffer.writeln('Travelers: ${planMembers.join(', ')}');
@@ -584,7 +591,7 @@ String _buildTripShareText(TravelTrip trip) {
   }
 
   if (trip.events.isEmpty) {
-    buffer.writeln('No plan yet.');
+    buffer.writeln('No trip items yet.');
   }
 
   buffer.writeln(_shareDivider(48));
@@ -830,6 +837,25 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
     await _upsertTrip(trip.copyWith(events: events));
   }
 
+  Future<void> _showCreateItemSheet(TravelTrip trip) async {
+    final action = await showModalBottomSheet<CreateItemAction>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => const CreateItemSheet(),
+    );
+
+    if (action == null || !mounted) {
+      return;
+    }
+
+    switch (action) {
+      case CreateItemAction.activity:
+        await _showEventDialog(trip);
+      case CreateItemAction.expense:
+        await _showEventDialog(trip, mode: EventFormMode.expense);
+    }
+  }
+
   Future<void> _showEventActions(TravelTrip trip, TravelEvent event) async {
     final action = await showModalBottomSheet<EventAction>(
       context: context,
@@ -878,10 +904,13 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
   }
 
   Future<void> _deleteEvent(TravelTrip trip, TravelEvent event) async {
+    final itemLabel = event.itemType == TripItemType.expense
+        ? 'expense'
+        : 'activity';
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Delete event'),
+        title: Text('Delete $itemLabel'),
         content: Text('Delete ${event.title}?'),
         actions: [
           TextButton(
@@ -905,68 +934,6 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
         events: trip.events
             .where((candidate) => candidate.id != event.id)
             .toList(),
-      ),
-    );
-  }
-
-  Future<void> _showEventTitleDialog(TravelTrip trip, TravelEvent event) async {
-    final titleController = TextEditingController(text: event.title);
-    final formKey = GlobalKey<FormState>();
-
-    final title = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Edit title'),
-        content: Form(
-          key: formKey,
-          child: TextFormField(
-            controller: titleController,
-            autofocus: true,
-            decoration: const InputDecoration(
-              labelText: 'Event title',
-              prefixIcon: Icon(Icons.event_outlined),
-            ),
-            textInputAction: TextInputAction.done,
-            validator: _requiredValidator,
-            onFieldSubmitted: (_) {
-              if (formKey.currentState!.validate()) {
-                Navigator.of(context).pop(titleController.text.trim());
-              }
-            },
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              if (formKey.currentState!.validate()) {
-                Navigator.of(context).pop(titleController.text.trim());
-              }
-            },
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-
-    titleController.dispose();
-
-    if (title == null || title == event.title) {
-      return;
-    }
-
-    await _upsertTrip(
-      trip.copyWith(
-        events: trip.events.map((candidate) {
-          if (candidate.id != event.id) {
-            return candidate;
-          }
-
-          return candidate.copyWith(title: title);
-        }).toList(),
       ),
     );
   }
@@ -1459,15 +1426,10 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                                 _showMembersDialog(selectedTrip),
                             onDeleteTrip: () => _deleteTrip(selectedTrip),
                             onShareTrip: () => _shareTrip(selectedTrip),
-                            onAddEvent: () => _showEventDialog(selectedTrip),
-                            onEditEvent: (event) =>
-                                _showEventDialog(selectedTrip, event: event),
+                            onAddEvent: () =>
+                                _showCreateItemSheet(selectedTrip),
                             onOpenEventActions: (event) =>
                                 _showEventActions(selectedTrip, event),
-                            onDeleteEvent: (event) =>
-                                _deleteEvent(selectedTrip, event),
-                            onRenameEvent: (event) =>
-                                _showEventTitleDialog(selectedTrip, event),
                             onTripChanged: _upsertTrip,
                             onAddAttachment: (event) =>
                                 _pickAttachment(selectedTrip, event: event),
@@ -1508,14 +1470,9 @@ class _TravelerHomePageState extends State<TravelerHomePage> {
                 onManageMembers: () => _showMembersDialog(selectedTrip),
                 onDeleteTrip: () => _deleteTrip(selectedTrip),
                 onShareTrip: () => _shareTrip(selectedTrip),
-                onAddEvent: () => _showEventDialog(selectedTrip),
-                onEditEvent: (event) =>
-                    _showEventDialog(selectedTrip, event: event),
+                onAddEvent: () => _showCreateItemSheet(selectedTrip),
                 onOpenEventActions: (event) =>
                     _showEventActions(selectedTrip, event),
-                onDeleteEvent: (event) => _deleteEvent(selectedTrip, event),
-                onRenameEvent: (event) =>
-                    _showEventTitleDialog(selectedTrip, event),
                 onTripChanged: _upsertTrip,
                 onAddAttachment: (event) =>
                     _pickAttachment(selectedTrip, event: event),
@@ -1702,7 +1659,7 @@ class TripListPane extends StatelessWidget {
                   trip.dateRangeLabel,
                   if (trip.country.isNotEmpty) trip.country,
                   trip.targetCurrency,
-                  '${trip.events.length} events',
+                  '${trip.events.length} items',
                 ].join(' - '),
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
@@ -1729,10 +1686,7 @@ class TripDetailView extends StatefulWidget {
     required this.onDeleteTrip,
     required this.onShareTrip,
     required this.onAddEvent,
-    required this.onEditEvent,
     required this.onOpenEventActions,
-    required this.onDeleteEvent,
-    required this.onRenameEvent,
     required this.onTripChanged,
     required this.onAddAttachment,
     required this.onPickPhoto,
@@ -1747,10 +1701,7 @@ class TripDetailView extends StatefulWidget {
   final VoidCallback onDeleteTrip;
   final VoidCallback onShareTrip;
   final VoidCallback onAddEvent;
-  final ValueChanged<TravelEvent> onEditEvent;
   final ValueChanged<TravelEvent> onOpenEventActions;
-  final ValueChanged<TravelEvent> onDeleteEvent;
-  final ValueChanged<TravelEvent> onRenameEvent;
   final ValueChanged<TravelTrip> onTripChanged;
   final AttachmentPickAction onAddAttachment;
   final AttachmentPhotoPickAction onPickPhoto;
@@ -1830,7 +1781,7 @@ class _TripDetailViewState extends State<TripDetailView>
           onTap: (_) => _collapseHeader(),
           tabs: const [
             Tab(icon: Icon(Icons.edit_note_outlined), text: 'Journal'),
-            Tab(icon: Icon(Icons.route_outlined), text: 'Plan'),
+            Tab(icon: Icon(Icons.route_outlined), text: 'Trip'),
             Tab(icon: Icon(Icons.currency_exchange), text: 'Currency'),
             Tab(icon: Icon(Icons.folder_open_outlined), text: 'Files'),
           ],
@@ -1841,16 +1792,14 @@ class _TripDetailViewState extends State<TripDetailView>
             children: [
               JournalTab(
                 trip: widget.trip,
+                onAddEvent: widget.onAddEvent,
                 onOpenEventActions: widget.onOpenEventActions,
                 onTripChanged: widget.onTripChanged,
               ),
               PlanTab(
                 trip: widget.trip,
                 onAddEvent: widget.onAddEvent,
-                onEditEvent: widget.onEditEvent,
                 onOpenEventActions: widget.onOpenEventActions,
-                onDeleteEvent: widget.onDeleteEvent,
-                onRenameEvent: widget.onRenameEvent,
               ),
               CurrencyTab(
                 trip: widget.trip,
@@ -1974,7 +1923,7 @@ class TripHeader extends StatelessWidget {
             icon: const Icon(Icons.group_outlined),
           ),
           IconButton(
-            tooltip: 'Share plan',
+            tooltip: 'Share trip',
             onPressed: onShare,
             icon: const Icon(Icons.ios_share_outlined),
           ),
@@ -2010,18 +1959,12 @@ class PlanTab extends StatefulWidget {
     super.key,
     required this.trip,
     required this.onAddEvent,
-    required this.onEditEvent,
     required this.onOpenEventActions,
-    required this.onDeleteEvent,
-    required this.onRenameEvent,
   });
 
   final TravelTrip trip;
   final VoidCallback onAddEvent;
-  final ValueChanged<TravelEvent> onEditEvent;
   final ValueChanged<TravelEvent> onOpenEventActions;
-  final ValueChanged<TravelEvent> onDeleteEvent;
-  final ValueChanged<TravelEvent> onRenameEvent;
 
   @override
   State<PlanTab> createState() => _PlanTabState();
@@ -2074,12 +2017,7 @@ class _PlanTabState extends State<PlanTab> {
           TimelineEventCard(
             trip: widget.trip,
             event: event,
-            isFirst: index == 0,
-            isLast: index == group.events.length - 1,
             onOpenActions: () => widget.onOpenEventActions(event),
-            onEdit: () => widget.onEditEvent(event),
-            onDelete: () => widget.onDeleteEvent(event),
-            onRename: () => widget.onRenameEvent(event),
           ),
         );
       }
@@ -2090,8 +2028,8 @@ class _PlanTabState extends State<PlanTab> {
         if (events.isEmpty)
           EmptyTabView(
             icon: Icons.route_outlined,
-            title: 'No plan yet',
-            actionLabel: 'Add event',
+            title: 'Start with anything',
+            actionLabel: 'Add activity or expense',
             onAction: widget.onAddEvent,
           )
         else
@@ -2106,9 +2044,10 @@ class _PlanTabState extends State<PlanTab> {
           right: 16,
           bottom: 16,
           child: FloatingActionButton.extended(
+            heroTag: 'add_trip_item',
             onPressed: widget.onAddEvent,
             icon: const Icon(Icons.add),
-            label: const Text('Event'),
+            label: const Text('Add'),
           ),
         ),
       ],
@@ -2179,32 +2118,39 @@ class DaySeparator extends StatelessWidget {
   }
 }
 
-class TimelineEventCard extends StatelessWidget {
+class TimelineEventCard extends StatefulWidget {
   const TimelineEventCard({
     super.key,
     required this.trip,
     required this.event,
-    required this.isFirst,
-    required this.isLast,
     required this.onOpenActions,
-    required this.onEdit,
-    required this.onDelete,
-    required this.onRename,
   });
 
   final TravelTrip trip;
   final TravelEvent event;
-  final bool isFirst;
-  final bool isLast;
   final VoidCallback onOpenActions;
-  final VoidCallback onEdit;
-  final VoidCallback onDelete;
-  final VoidCallback onRename;
+
+  @override
+  State<TimelineEventCard> createState() => _TimelineEventCardState();
+}
+
+class _TimelineEventCardState extends State<TimelineEventCard> {
+  var _expanded = false;
+
+  @override
+  void didUpdateWidget(covariant TimelineEventCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.event.id != widget.event.id) {
+      _expanded = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
+    final event = widget.event;
+    final trip = widget.trip;
     final planLabels = _memberTagLabelsForIds(trip, event.planMemberIds);
     final fileCount = _attachmentKindCount(
       event.attachments,
@@ -2215,226 +2161,282 @@ class TimelineEventCard extends StatelessWidget {
       AttachmentKind.photo,
     );
     final eventExpenseTotal = _expenseAmountInTripCurrency(trip, event);
+    final isExpense = event.itemType == TripItemType.expense;
+    final summary = [
+      if (isExpense) 'Expense',
+      if (!isExpense && event.location.isNotEmpty) event.location,
+      if (!isExpense && event.location.isEmpty && event.planNotes.isNotEmpty)
+        event.planNotes,
+      if (!isExpense && event.location.isEmpty && event.planNotes.isEmpty)
+        'Activity',
+    ].join(' - ');
+    final hasDetails =
+        event.location.isNotEmpty ||
+        event.planNotes.isNotEmpty ||
+        event.isFlexible ||
+        eventExpenseTotal > 0 ||
+        planLabels.isNotEmpty ||
+        event.feeling.isNotEmpty ||
+        fileCount > 0 ||
+        photoCount > 0;
+    final accent = isExpense
+        ? colors.tertiaryContainer
+        : colors.primaryContainer;
+    final onAccent = isExpense
+        ? colors.onTertiaryContainer
+        : colors.onPrimaryContainer;
 
-    return IntrinsicHeight(
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          SizedBox(
-            width: 74,
+    return Row(
+      key: ValueKey('timeline_item_${event.id}'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 58,
+          child: Padding(
+            padding: const EdgeInsets.only(top: 14),
             child: Column(
               children: [
-                Expanded(
-                  child: Container(
-                    width: 2,
-                    color: isFirst ? Colors.transparent : colors.outlineVariant,
+                Text(
+                  _timeFormatter.format(event.startAt),
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: colors.onSurfaceVariant,
                   ),
                 ),
-                Container(
-                  width: 38,
-                  height: 38,
-                  decoration: BoxDecoration(
-                    color: colors.primary,
-                    shape: BoxShape.circle,
-                  ),
-                  child: Center(
-                    child: Text(
-                      _timeFormatter.format(event.startAt),
-                      style: theme.textTheme.labelSmall?.copyWith(
-                        color: colors.onPrimary,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                ),
-                Expanded(
-                  child: Container(
-                    width: 2,
-                    color: isLast ? Colors.transparent : colors.outlineVariant,
-                  ),
+                const SizedBox(height: 5),
+                Icon(
+                  isExpense
+                      ? Icons.receipt_long_outlined
+                      : Icons.place_outlined,
+                  size: 18,
+                  color: isExpense ? colors.tertiary : colors.primary,
                 ),
               ],
             ),
           ),
-          Expanded(
-            child: Card(
-              margin: const EdgeInsets.only(bottom: 12),
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+        ),
+        Expanded(
+          child: Card(
+            margin: const EdgeInsets.only(bottom: 8),
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                InkWell(
+                  key: ValueKey('timeline_expand_${event.id}'),
+                  onTap: hasDetails
+                      ? () => setState(() => _expanded = !_expanded)
+                      : widget.onOpenActions,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(14, 12, 6, 12),
+                    child: Row(
                       children: [
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Row(
-                                children: [
-                                  Flexible(
-                                    child: TextButton(
-                                      onPressed: onRename,
-                                      style: TextButton.styleFrom(
-                                        alignment: Alignment.centerLeft,
-                                        foregroundColor: colors.onSurface,
-                                        padding: EdgeInsets.zero,
-                                        minimumSize: Size.zero,
-                                        tapTargetSize:
-                                            MaterialTapTargetSize.shrinkWrap,
-                                      ),
-                                      child: Text(
-                                        event.title,
-                                        maxLines: 2,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: theme.textTheme.titleMedium
-                                            ?.copyWith(
-                                              fontWeight: FontWeight.w700,
-                                            ),
-                                      ),
-                                    ),
-                                  ),
-                                  IconButton(
-                                    tooltip: 'Edit title',
-                                    onPressed: onRename,
-                                    visualDensity: VisualDensity.compact,
-                                    icon: const Icon(
-                                      Icons.edit_outlined,
-                                      size: 18,
-                                    ),
-                                  ),
-                                ],
+                              Text(
+                                event.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.w700,
+                                ),
                               ),
-                              const SizedBox(height: 4),
-                              InkWell(
-                                onTap: onOpenActions,
-                                onLongPress: onEdit,
-                                borderRadius: BorderRadius.circular(6),
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                    vertical: 2,
-                                  ),
-                                  child: Text(
-                                    '${_dayFormatter.format(event.startAt)} - ${event.timeRangeLabel}',
-                                    style: theme.textTheme.bodySmall,
-                                  ),
+                              const SizedBox(height: 3),
+                              Text(
+                                summary,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: colors.onSurfaceVariant,
                                 ),
                               ),
                             ],
                           ),
                         ),
+                        if (eventExpenseTotal > 0) ...[
+                          const SizedBox(width: 8),
+                          DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: accent,
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 9,
+                                vertical: 5,
+                              ),
+                              child: ConstrainedBox(
+                                constraints: const BoxConstraints(
+                                  maxWidth: 96,
+                                ),
+                                child: Text(
+                                  _formatMoney(
+                                    trip.targetCurrency,
+                                    eventExpenseTotal,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.labelSmall?.copyWith(
+                                    color: onAccent,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                         IconButton(
-                          tooltip: 'Delete event',
-                          onPressed: onDelete,
-                          icon: const Icon(Icons.delete_outline),
+                          tooltip: 'Item actions',
+                          onPressed: widget.onOpenActions,
+                          visualDensity: VisualDensity.compact,
+                          icon: const Icon(Icons.more_horiz),
                         ),
+                        if (hasDetails)
+                          Icon(
+                            _expanded
+                                ? Icons.expand_less
+                                : Icons.expand_more,
+                            color: colors.onSurfaceVariant,
+                          ),
                       ],
                     ),
-                    InkWell(
-                      onTap: onOpenActions,
-                      onLongPress: onEdit,
-                      borderRadius: BorderRadius.circular(8),
-                      child: Padding(
-                        padding: const EdgeInsets.only(top: 8),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            if (event.location.isNotEmpty) ...[
-                              IconLine(
-                                icon: Icons.place_outlined,
-                                text: event.location,
-                              ),
-                            ],
-                            if (event.planNotes.isNotEmpty) ...[
-                              const SizedBox(height: 12),
-                              Text(event.planNotes),
-                            ],
-                            const SizedBox(height: 12),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 6,
-                              children: [
-                                if (event.isFlexible)
-                                  const Chip(
-                                    avatar: Icon(Icons.bolt_outlined, size: 18),
-                                    label: Text('Flexible'),
-                                    visualDensity: VisualDensity.compact,
-                                  ),
-                                if (eventExpenseTotal > 0)
-                                  Chip(
-                                    avatar: const Icon(
-                                      Icons.receipt_long_outlined,
-                                      size: 18,
-                                    ),
-                                    label: Text(
-                                      _formatMoney(
-                                        trip.targetCurrency,
-                                        eventExpenseTotal,
-                                      ),
-                                    ),
-                                    visualDensity: VisualDensity.compact,
-                                  ),
-                                for (final label in planLabels)
-                                  Chip(
-                                    avatar: Icon(
-                                      label == 'All'
-                                          ? Icons.groups_outlined
-                                          : Icons.person_outline,
-                                      size: 18,
-                                    ),
-                                    label: Text(label),
-                                    visualDensity: VisualDensity.compact,
-                                  ),
-                                if (event.feeling.isNotEmpty)
-                                  Chip(
-                                    avatar: const Icon(
-                                      Icons.favorite_border,
-                                      size: 18,
-                                    ),
-                                    label: Text(event.feeling),
-                                    visualDensity: VisualDensity.compact,
-                                  ),
-                                if (fileCount > 0)
-                                  Chip(
-                                    avatar: const Icon(
-                                      Icons.attach_file,
-                                      size: 18,
-                                    ),
-                                    label: Text(
-                                      _attachmentCountLabel(
-                                        fileCount,
-                                        AttachmentKind.file,
-                                      ),
-                                    ),
-                                    visualDensity: VisualDensity.compact,
-                                  ),
-                                if (photoCount > 0)
-                                  Chip(
-                                    avatar: const Icon(
-                                      Icons.photo_library_outlined,
-                                      size: 18,
-                                    ),
-                                    label: Text(
-                                      _attachmentCountLabel(
-                                        photoCount,
-                                        AttachmentKind.photo,
-                                      ),
-                                    ),
-                                    visualDensity: VisualDensity.compact,
-                                  ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
-              ),
+                if (_expanded) ...[
+                  const Divider(height: 1),
+                  Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (!isExpense)
+                          Text(
+                            event.timeRangeLabel,
+                            style: theme.textTheme.labelMedium?.copyWith(
+                              color: colors.onSurfaceVariant,
+                            ),
+                          ),
+                        if (!isExpense && event.location.isNotEmpty) ...[
+                          const SizedBox(height: 10),
+                          IconLine(
+                            icon: Icons.place_outlined,
+                            text: event.location,
+                          ),
+                        ],
+                        if (event.planNotes.isNotEmpty) ...[
+                          const SizedBox(height: 10),
+                          Text(event.planNotes),
+                        ],
+                        if (hasDetails) ...[
+                          const SizedBox(height: 10),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 4,
+                            children: [
+                              if (event.isFlexible && !isExpense)
+                                const Chip(
+                                  avatar: Icon(Icons.bolt_outlined, size: 16),
+                                  label: Text('Flexible'),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              for (final label in planLabels)
+                                Chip(
+                                  avatar: Icon(
+                                    label == 'All'
+                                        ? Icons.groups_outlined
+                                        : Icons.person_outline,
+                                    size: 16,
+                                  ),
+                                  label: Text(label),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              if (event.feeling.isNotEmpty)
+                                Chip(
+                                  avatar: const Icon(
+                                    Icons.favorite_border,
+                                    size: 16,
+                                  ),
+                                  label: Text(event.feeling),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              if (fileCount > 0)
+                                Chip(
+                                  avatar: const Icon(Icons.attach_file, size: 16),
+                                  label: Text(
+                                    _attachmentCountLabel(
+                                      fileCount,
+                                      AttachmentKind.file,
+                                    ),
+                                  ),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              if (photoCount > 0)
+                                Chip(
+                                  avatar: const Icon(
+                                    Icons.photo_library_outlined,
+                                    size: 16,
+                                  ),
+                                  label: Text(
+                                    _attachmentCountLabel(
+                                      photoCount,
+                                      AttachmentKind.photo,
+                                    ),
+                                  ),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                            ],
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ],
             ),
           ),
-        ],
+        ),
+      ],
+    );
+  }
+}
+
+class CreateItemSheet extends StatelessWidget {
+  const CreateItemSheet({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Add to this trip',
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+            ActionTile(
+              icon: Icons.place_outlined,
+              title: 'Activity',
+              subtitle: 'Something you plan or did',
+              onTap: () =>
+                  Navigator.of(context).pop(CreateItemAction.activity),
+            ),
+            ActionTile(
+              icon: Icons.receipt_long_outlined,
+              title: 'Expense',
+              subtitle: 'Record a cost without creating an activity first',
+              onTap: () =>
+                  Navigator.of(context).pop(CreateItemAction.expense),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -2468,19 +2470,21 @@ class EventActionsSheet extends StatelessWidget {
                   overflow: TextOverflow.ellipsis,
                 ),
                 const SizedBox(height: 12),
-                ActionTile(
-                  icon: Icons.route_outlined,
-                  title: 'Plan details',
-                  subtitle: 'Time, duration, and notes',
-                  onTap: () => Navigator.of(context).pop(EventAction.plan),
-                ),
-                ActionTile(
-                  icon: Icons.edit_note_outlined,
-                  title: 'Experience',
-                  subtitle: 'Journal notes and feeling',
-                  onTap: () =>
-                      Navigator.of(context).pop(EventAction.experience),
-                ),
+                if (event.itemType == TripItemType.activity) ...[
+                  ActionTile(
+                    icon: Icons.route_outlined,
+                    title: 'Activity details',
+                    subtitle: 'Time, duration, and notes',
+                    onTap: () => Navigator.of(context).pop(EventAction.plan),
+                  ),
+                  ActionTile(
+                    icon: Icons.edit_note_outlined,
+                    title: 'Experience',
+                    subtitle: 'Journal notes and feeling',
+                    onTap: () =>
+                        Navigator.of(context).pop(EventAction.experience),
+                  ),
+                ],
                 ActionTile(
                   icon: Icons.receipt_long_outlined,
                   title: 'Expense',
@@ -2496,7 +2500,7 @@ class EventActionsSheet extends StatelessWidget {
                 const Divider(),
                 ActionTile(
                   icon: Icons.delete_outline,
-                  title: 'Delete event',
+                  title: 'Delete item',
                   subtitle: 'Remove this item from the trip',
                   onTap: () => Navigator.of(context).pop(EventAction.delete),
                 ),
@@ -2540,11 +2544,13 @@ class JournalTab extends StatefulWidget {
   const JournalTab({
     super.key,
     required this.trip,
+    required this.onAddEvent,
     required this.onOpenEventActions,
     required this.onTripChanged,
   });
 
   final TravelTrip trip;
+  final VoidCallback onAddEvent;
   final ValueChanged<TravelEvent> onOpenEventActions;
   final ValueChanged<TravelTrip> onTripChanged;
 
@@ -2588,41 +2594,61 @@ class _JournalTabState extends State<JournalTab> {
     final events = widget.trip.sortedEvents;
 
     if (events.isEmpty) {
-      return const EmptyTabView(
+      return EmptyTabView(
         icon: Icons.edit_note_outlined,
-        title: 'No entries yet',
+        title: 'Start with anything',
+        actionLabel: 'Add activity or expense',
+        onAction: widget.onAddEvent,
       );
     }
 
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => FocusScope.of(context).unfocus(),
-      child: AppScrollbar(
-        builder: (controller) => ListView(
-          controller: controller,
-          keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-          padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
-          children: [
-            ExpenseSummaryCard(trip: widget.trip, onTap: _openExpenseDetails),
-            const SizedBox(height: 12),
-            for (final group in _groupEventsByDay(events)) ...[
-              DaySeparator(
-                date: group.date,
-                collapsed: _collapsedDays.contains(_dayKey(group.date)),
-                count: group.events.length,
-                onTap: () => _toggleDay(group.date),
-              ),
-              if (!_collapsedDays.contains(_dayKey(group.date)))
-                for (final event in group.events)
-                  JournalEventCard(
-                    trip: widget.trip,
-                    event: event,
-                    onTap: () => widget.onOpenEventActions(event),
+    return Stack(
+      children: [
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => FocusScope.of(context).unfocus(),
+          child: AppScrollbar(
+            builder: (controller) => ListView(
+              controller: controller,
+              keyboardDismissBehavior:
+                  ScrollViewKeyboardDismissBehavior.onDrag,
+              padding: const EdgeInsets.fromLTRB(16, 16, 20, 96),
+              children: [
+                ExpenseSummaryCard(
+                  trip: widget.trip,
+                  onTap: _openExpenseDetails,
+                ),
+                const SizedBox(height: 12),
+                for (final group in _groupEventsByDay(events)) ...[
+                  DaySeparator(
+                    date: group.date,
+                    collapsed: _collapsedDays.contains(_dayKey(group.date)),
+                    count: group.events.length,
+                    onTap: () => _toggleDay(group.date),
                   ),
-            ],
-          ],
+                  if (!_collapsedDays.contains(_dayKey(group.date)))
+                    for (final event in group.events)
+                      JournalEventCard(
+                        trip: widget.trip,
+                        event: event,
+                        onTap: () => widget.onOpenEventActions(event),
+                      ),
+                ],
+              ],
+            ),
+          ),
         ),
-      ),
+        Positioned(
+          right: 16,
+          bottom: 16,
+          child: FloatingActionButton.extended(
+            heroTag: 'add_journal_item',
+            onPressed: widget.onAddEvent,
+            icon: const Icon(Icons.add),
+            label: const Text('Add'),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -2878,6 +2904,23 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
         if (candidate.id == savedEvent.id) savedEvent else candidate,
     ];
     final updatedTrip = _trip.copyWith(events: events);
+    setState(() => _trip = updatedTrip);
+    widget.onTripChanged(updatedTrip);
+  }
+
+  Future<void> _addExpense() async {
+    final savedEvent = await showDialog<TravelEvent>(
+      context: context,
+      builder: (context) => EventFormDialog(
+        trip: _trip,
+        mode: EventFormMode.expense,
+      ),
+    );
+    if (savedEvent == null || !mounted) {
+      return;
+    }
+
+    final updatedTrip = _trip.copyWith(events: [..._trip.events, savedEvent]);
     setState(() => _trip = updatedTrip);
     widget.onTripChanged(updatedTrip);
   }
@@ -3203,11 +3246,17 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
 
     return Scaffold(
       appBar: AppBar(title: const Text('Expenses')),
+      floatingActionButton: FloatingActionButton.extended(
+        heroTag: 'add_expense_item',
+        onPressed: _addExpense,
+        icon: const Icon(Icons.add),
+        label: const Text('Expense'),
+      ),
       body: SafeArea(
         child: AppScrollbar(
           builder: (controller) => ListView(
             controller: controller,
-            padding: const EdgeInsets.fromLTRB(16, 16, 20, 24),
+            padding: const EdgeInsets.fromLTRB(16, 16, 20, 96),
             children: [
               Wrap(
                 spacing: 8,
@@ -3283,117 +3332,90 @@ class _ExpenseDetailsPageState extends State<ExpenseDetailsPage> {
                   Card(
                     color: _expenseCardColor(item.expense),
                     clipBehavior: Clip.antiAlias,
-                    child: InkWell(
-                      onTap: () => _editExpenseEvent(item.event),
-                      child: Padding(
-                        padding: const EdgeInsets.all(14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        item.expense.title,
-                                        style: Theme.of(context)
-                                            .textTheme
-                                            .titleMedium
-                                            ?.copyWith(
-                                              fontWeight: FontWeight.w700,
-                                            ),
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        '${item.event.title} - ${_dayFormatter.format(item.event.startAt)} - ${item.event.timeRangeLabel}',
-                                        style: Theme.of(context)
-                                            .textTheme
-                                            .bodySmall
-                                            ?.copyWith(
-                                              color: colors.onSurfaceVariant,
-                                            ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                Flexible(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.end,
-                                    children: [
-                                      Text(
-                                        _expenseTripAmountLabel(item.expense),
-                                        maxLines: 2,
-                                        overflow: TextOverflow.ellipsis,
-                                        textAlign: TextAlign.right,
-                                        style: Theme.of(context)
-                                            .textTheme
-                                            .titleMedium
-                                            ?.copyWith(
-                                              fontWeight: FontWeight.w800,
-                                            ),
-                                      ),
-                                      const SizedBox(height: 2),
-                                      Text(
-                                        _expenseMyrAmountLabel(item.expense),
-                                        maxLines: 2,
-                                        overflow: TextOverflow.ellipsis,
-                                        textAlign: TextAlign.right,
-                                        style: Theme.of(
-                                          context,
-                                        ).textTheme.bodySmall,
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                IconButton(
-                                  tooltip: 'Edit expense',
-                                  onPressed: () =>
-                                      _editExpenseEvent(item.event),
-                                  visualDensity: VisualDensity.compact,
-                                  icon: const Icon(Icons.edit_outlined),
-                                ),
-                              ],
+                    child: ExpansionTile(
+                      key: ValueKey('expense_item_${item.expense.id}'),
+                      tilePadding: const EdgeInsets.symmetric(horizontal: 14),
+                      childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+                      title: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              item.expense.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.titleMedium
+                                  ?.copyWith(fontWeight: FontWeight.w700),
                             ),
-                            const SizedBox(height: 10),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
-                              children: [
-                                Chip(
-                                  avatar: const Icon(
-                                    Icons.receipt_long_outlined,
-                                    size: 18,
-                                  ),
-                                  label: Text(
-                                    _expenseSourceAmountLabel(item.expense),
-                                  ),
-                                  visualDensity: VisualDensity.compact,
-                                ),
-                                for (final label in _memberTagLabelsForIds(
-                                  _trip,
-                                  item.expense.memberIds,
-                                ))
-                                  Chip(
-                                    avatar: Icon(
-                                      label == 'All'
-                                          ? Icons.groups_outlined
-                                          : Icons.person_outline,
-                                      size: 18,
-                                    ),
-                                    label: Text(label),
-                                    visualDensity: VisualDensity.compact,
-                                  ),
-                                ..._paymentStatusChips(item.expense),
-                              ],
+                          ),
+                          const SizedBox(width: 8),
+                          Flexible(
+                            child: Text(
+                              _expenseTripAmountLabel(item.expense),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              textAlign: TextAlign.right,
+                              style: Theme.of(context).textTheme.titleSmall
+                                  ?.copyWith(fontWeight: FontWeight.w800),
                             ),
-                          ],
+                          ),
+                        ],
+                      ),
+                      subtitle: Text(
+                        [
+                          _dayFormatter.format(item.event.startAt),
+                          _timeFormatter.format(item.event.startAt),
+                          _expenseMyrAmountLabel(item.expense),
+                        ].join(' - '),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: colors.onSurfaceVariant,
                         ),
                       ),
+                      children: [
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: Wrap(
+                            spacing: 6,
+                            runSpacing: 4,
+                            children: [
+                              Chip(
+                                avatar: const Icon(
+                                  Icons.receipt_long_outlined,
+                                  size: 16,
+                                ),
+                                label: Text(
+                                  _expenseSourceAmountLabel(item.expense),
+                                ),
+                                visualDensity: VisualDensity.compact,
+                              ),
+                              for (final label in _memberTagLabelsForIds(
+                                _trip,
+                                item.expense.memberIds,
+                              ))
+                                Chip(
+                                  avatar: Icon(
+                                    label == 'All'
+                                        ? Icons.groups_outlined
+                                        : Icons.person_outline,
+                                    size: 16,
+                                  ),
+                                  label: Text(label),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              ..._paymentStatusChips(item.expense),
+                            ],
+                          ),
+                        ),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton.icon(
+                            onPressed: () => _editExpenseEvent(item.event),
+                            icon: const Icon(Icons.edit_outlined, size: 18),
+                            label: const Text('Edit'),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                   const SizedBox(height: 8),
@@ -3423,150 +3445,119 @@ class JournalEventCard extends StatelessWidget {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
     final planLabels = _memberTagLabelsForIds(trip, event.planMemberIds);
+    final expenseTotal = _expenseAmountInTripCurrency(trip, event);
+    final summary = [
+      if (event.journal.isNotEmpty) event.journal,
+      if (event.journal.isEmpty && event.planNotes.isNotEmpty) event.planNotes,
+      if (event.journal.isEmpty &&
+          event.planNotes.isEmpty &&
+          event.location.isNotEmpty)
+        event.location,
+      if (expenseTotal > 0) _formatMoney(trip.targetCurrency, expenseTotal),
+    ].join(' - ');
 
     return Card(
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(8),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(
-                width: 82,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      _shortDayFormatter.format(event.startAt),
-                      style: theme.textTheme.titleSmall?.copyWith(
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      event.timeRangeLabel,
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Expanded(
-                          child: Text(
-                            event.title,
-                            style: theme.textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.w700,
-                            ),
-                            maxLines: 2,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        if (event.feeling.isNotEmpty)
-                          Padding(
-                            padding: const EdgeInsets.only(left: 8),
-                            child: DecoratedBox(
-                              decoration: BoxDecoration(
-                                color: colors.primaryContainer,
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                              child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 10,
-                                  vertical: 5,
-                                ),
-                                child: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    Icon(
-                                      Icons.favorite_border,
-                                      size: 16,
-                                      color: colors.onPrimaryContainer,
-                                    ),
-                                    const SizedBox(width: 4),
-                                    Text(
-                                      event.feeling,
-                                      style: theme.textTheme.labelMedium
-                                          ?.copyWith(
-                                            color: colors.onPrimaryContainer,
-                                          ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    if (event.planNotes.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      Text(
-                        event.planNotes,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: colors.onSurfaceVariant,
-                          height: 1.25,
-                        ),
-                      ),
-                    ],
-                    if (planLabels.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 6,
-                        runSpacing: 6,
-                        children: [
-                          for (final label in planLabels)
-                            Chip(
-                              avatar: Icon(
-                                label == 'All'
-                                    ? Icons.groups_outlined
-                                    : Icons.person_outline,
-                                size: 16,
-                              ),
-                              label: Text(label),
-                              visualDensity: VisualDensity.compact,
-                              materialTapTargetSize:
-                                  MaterialTapTargetSize.shrinkWrap,
-                            ),
-                        ],
-                      ),
-                    ],
-                    if (event.journal.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      Text(
-                        event.journal,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: colors.onSurfaceVariant,
-                          height: 1.25,
-                        ),
-                      ),
-                    ],
-                    if (event.location.isNotEmpty) ...[
-                      const SizedBox(height: 10),
-                      IconLine(
-                        icon: Icons.place_outlined,
-                        text: event.location,
-                      ),
-                    ],
-                    if (event.expenses.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      JournalBillPanel(trip: trip, event: event),
-                    ],
-                  ],
-                ),
-              ),
-            ],
+      clipBehavior: Clip.antiAlias,
+      child: ExpansionTile(
+        key: ValueKey('journal_item_${event.id}'),
+        tilePadding: const EdgeInsets.symmetric(horizontal: 14),
+        childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+        leading: Icon(
+          event.itemType == TripItemType.expense
+              ? Icons.receipt_long_outlined
+              : Icons.place_outlined,
+          color: event.itemType == TripItemType.expense
+              ? colors.tertiary
+              : colors.primary,
+        ),
+        title: Text(
+          event.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.titleMedium?.copyWith(
+            fontWeight: FontWeight.w700,
           ),
         ),
+        subtitle: Text(
+          [
+            _timeFormatter.format(event.startAt),
+            if (summary.isNotEmpty) summary,
+          ].join(' - '),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: colors.onSurfaceVariant,
+          ),
+        ),
+        children: [
+          if (event.planNotes.isNotEmpty)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(event.planNotes),
+            ),
+          if (planLabels.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 4,
+                children: [
+                  for (final label in planLabels)
+                    Chip(
+                      avatar: Icon(
+                        label == 'All'
+                            ? Icons.groups_outlined
+                            : Icons.person_outline,
+                        size: 16,
+                      ),
+                      label: Text(label),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                ],
+              ),
+            ),
+          ],
+          if (event.journal.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                event.journal,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: colors.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ],
+          if (event.location.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            IconLine(icon: Icons.place_outlined, text: event.location),
+          ],
+          if (event.feeling.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Chip(
+                avatar: const Icon(Icons.favorite_border, size: 16),
+                label: Text(event.feeling),
+                visualDensity: VisualDensity.compact,
+              ),
+            ),
+          ],
+          if (event.expenses.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            JournalBillPanel(trip: trip, event: event),
+          ],
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton.icon(
+              onPressed: onTap,
+              icon: const Icon(Icons.more_horiz, size: 18),
+              label: const Text('More'),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -5657,7 +5648,11 @@ class _EventFormDialogState extends State<EventFormDialog> {
   void initState() {
     super.initState();
     final event = widget.event;
-    final startAt = event?.startAt ?? widget.trip.startDate ?? DateTime.now();
+    final startAt =
+        event?.startAt ??
+        (widget.mode == EventFormMode.expense
+            ? DateTime.now()
+            : widget.trip.startDate ?? DateTime.now());
     _titleController = TextEditingController(text: event?.title ?? '');
     _locationController = TextEditingController(text: event?.location ?? '');
     _durationController = TextEditingController(
@@ -5810,7 +5805,11 @@ class _EventFormDialogState extends State<EventFormDialog> {
       );
     }
     final primaryExpense = expenses.isEmpty ? null : expenses.first;
-    final duration = _isFlexible ? 0 : _minutesBetween(_time, _endTime);
+    final isStandaloneExpense =
+        widget.event == null && widget.mode == EventFormMode.expense;
+    final duration = isStandaloneExpense || _isFlexible
+        ? 0
+        : _minutesBetween(_time, _endTime);
     final startAt = DateTime(
       _date.year,
       _date.month,
@@ -5819,10 +5818,20 @@ class _EventFormDialogState extends State<EventFormDialog> {
       _time.minute,
     );
 
+    final itemType =
+        widget.event?.itemType ??
+        (widget.mode == EventFormMode.expense
+            ? TripItemType.expense
+            : TripItemType.activity);
+    final resolvedTitle = itemType == TripItemType.expense
+        ? primaryExpense?.title ?? 'Expense'
+        : _titleController.text.trim();
+
     Navigator.of(context).pop(
       TravelEvent(
         id: widget.event?.id ?? _newId('event'),
-        title: _titleController.text.trim(),
+        itemType: itemType,
+        title: resolvedTitle,
         location: _locationController.text.trim(),
         startAt: startAt,
         durationMinutes: duration,
@@ -5833,7 +5842,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
         expenseCurrencyCode:
             primaryExpense?.currencyCode ?? widget.trip.targetCurrency,
         splitCount: primaryExpense?.splitCount ?? 1,
-        isFlexible: _isFlexible,
+        isFlexible: isStandaloneExpense || _isFlexible,
         attachments: widget.event?.attachments ?? const [],
         expenseMemberIds: primaryExpense?.memberIds ?? const <String>[],
         expenses: expenses,
@@ -5951,7 +5960,13 @@ class _EventFormDialogState extends State<EventFormDialog> {
               keyboardType: const TextInputType.numberWithOptions(
                 decimal: true,
               ),
-              validator: _optionalPositiveNumberValidator,
+              validator:
+                  widget.mode == EventFormMode.expense &&
+                      (widget.event == null ||
+                          widget.event!.itemType == TripItemType.expense) &&
+                      index == 0
+                  ? _positiveNumberValidator
+                  : _optionalPositiveNumberValidator,
             ),
             const SizedBox(height: 12),
             InputDecorator(
@@ -6105,9 +6120,13 @@ class _EventFormDialogState extends State<EventFormDialog> {
     final isExperienceMode = widget.mode == EventFormMode.experience;
     final isExpenseMode = widget.mode == EventFormMode.expense;
     final title = widget.event == null
-        ? 'New event'
+        ? switch (widget.mode) {
+            EventFormMode.plan => 'New activity',
+            EventFormMode.experience => 'New experience',
+            EventFormMode.expense => 'New expense',
+          }
         : switch (widget.mode) {
-            EventFormMode.plan => 'Plan details',
+            EventFormMode.plan => 'Activity details',
             EventFormMode.experience => 'Experience',
             EventFormMode.expense => 'Expense',
           };
@@ -6128,7 +6147,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
                     TextFormField(
                       controller: _titleController,
                       decoration: const InputDecoration(
-                        labelText: 'Event title',
+                        labelText: 'Activity title',
                         prefixIcon: Icon(Icons.event_outlined),
                       ),
                       textInputAction: TextInputAction.next,
@@ -6190,7 +6209,7 @@ class _EventFormDialogState extends State<EventFormDialog> {
                     TextFormField(
                       controller: _planController,
                       decoration: const InputDecoration(
-                        labelText: 'Plan',
+                        labelText: 'Notes (optional)',
                         prefixIcon: Icon(Icons.subject_outlined),
                       ),
                       minLines: 3,
@@ -6258,6 +6277,24 @@ class _EventFormDialogState extends State<EventFormDialog> {
                     ),
                   ],
                   if (isExpenseMode) ...[
+                    if (widget.event == null ||
+                        widget.event!.itemType == TripItemType.expense) ...[
+                      ResponsiveFieldRow(
+                        children: [
+                          DatePickButton(
+                            label: 'Date',
+                            value: _date,
+                            onTap: _pickDate,
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: _pickTime,
+                            icon: const Icon(Icons.schedule),
+                            label: Text('At ${_time.format(context)}'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                    ],
                     for (
                       var index = 0;
                       index < _expenseRows.length;
@@ -6602,6 +6639,7 @@ class TravelExpense {
 class TravelEvent {
   const TravelEvent({
     required this.id,
+    required this.itemType,
     required this.title,
     required this.location,
     required this.startAt,
@@ -6656,9 +6694,14 @@ class TravelEvent {
       );
     }
     final primaryExpense = expenses.isEmpty ? null : expenses.first;
+    final itemType = switch (json['itemType']) {
+      'expense' => TripItemType.expense,
+      _ => TripItemType.activity,
+    };
 
     return TravelEvent(
       id: json['id'] as String? ?? _newId('event'),
+      itemType: itemType,
       title: json['title'] as String? ?? 'Untitled event',
       location: json['location'] as String? ?? '',
       startAt:
@@ -6684,6 +6727,7 @@ class TravelEvent {
   }
 
   final String id;
+  final TripItemType itemType;
   final String title;
   final String location;
   final DateTime startAt;
@@ -6711,6 +6755,7 @@ class TravelEvent {
   }
 
   TravelEvent copyWith({
+    TripItemType? itemType,
     String? title,
     String? location,
     DateTime? startAt,
@@ -6729,6 +6774,7 @@ class TravelEvent {
   }) {
     return TravelEvent(
       id: id,
+      itemType: itemType ?? this.itemType,
       title: title ?? this.title,
       location: location ?? this.location,
       startAt: startAt ?? this.startAt,
@@ -6750,6 +6796,7 @@ class TravelEvent {
   Map<String, Object?> toJson() {
     return {
       'id': id,
+      'itemType': itemType.name,
       'title': title,
       'location': location,
       'startAt': startAt.toIso8601String(),
